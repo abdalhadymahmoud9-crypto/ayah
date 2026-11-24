@@ -283,6 +283,20 @@ export function filterRelevant(sources: RagSource[], keywords: string[]): RagSou
     return stems.some(k => h.includes(k));
   });
 }
+// Stricter display bar: a passage is shown only if it matches at least 2 distinct key stems (or the single stem when only one exists).
+export function strongRelevant(sources: RagSource[], keywords: string[]): RagSource[] {
+  const stems = [...new Set(keywords.map(k => normalizeArabic(k).replace(/^ال/, '')).filter(k => k.length >= 3))];
+  if (stems.length === 0) return sources;
+  const need = Math.min(2, stems.length);
+  const GENERIC = new Set(['صلاه', 'صلي', 'لبس', 'حكم', 'فعل', 'عمل', 'قال', 'جواز', 'شرع']);
+  const topical = stems.filter(k => !GENERIC.has(k));
+  return sources.filter(s => {
+    const h = normalizeArabic(s.text);
+    const m = stems.filter(k => h.includes(k));
+    // at least 2 distinct stems, and when the question has topical (non-generic) terms, at least one of them must match
+    return m.length >= need && (topical.length === 0 || m.some(k => !GENERIC.has(k)));
+  });
+}
 
 async function retrieveMulti(queries: string[], budgetMs = 8000): Promise<RetrieveResult> {
   const uniq = [...new Set(queries.map(q => q.trim()).filter(Boolean))];
@@ -309,7 +323,9 @@ function buildEvidenceBlock(sources: RagSource[]): string {
 }
 
 const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط)، وأرفق رابط الشاملة الكامل نفسه في خانة الموضع لكل مرجع؛ فالمرجع بلا رابط يُحذف آلياً.\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- كل معلومة أو نسبة لعالم أو كتاب تذكرها خارج علامات الاقتباس يجب أن تكون مما ورد صراحة في الفقرات المسترجعة؛ لا تضف تفصيلاً أو عزواً أو اسم كتاب لم يرد فيها، وإن لم يرد فصرّح بأنه لم يرد في المصادر المسترجعة.
-- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.`;
+- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.
+- إن كانت رسالة المستخدم رغبة أو جملة عامة غير محددة (مثل «عاوز أتجوز» أو «عايز أتوب») وليست مسألة شرعية واضحة، فلا تسرد أحكاماً غير مرتبطة بها؛ اسأل سؤالاً توضيحياً واحداً قصيراً بلغة المستخدم عمّا يريد معرفته (شروط؟ آداب؟ خطوات؟) واذكر باختصار ما يمكنك المساعدة فيه، ولا تخترع نصوصاً.
+- إن لم تتعلق الفقرات المسترجعة بسؤال المستخدم فعلاً، فقل ذلك صراحة ولا تستشهد بها.`;
 
 /* ---- Server-side citation validation: no citation is presented as verified
  * unless it is backed by text actually retrieved in THIS request. ---- */
@@ -321,6 +337,7 @@ export function normalizeArabic(s: string): string {
     .replace(/\u0649/g, '\u064A')
     .replace(/\u0629/g, '\u0647')
     .replace(/[\u0624\u0626]/g, '\u0621')
+    .replace(/[\u060C\u061B\u061F\u066A-\u066D\u06D4]/g, ' ')
     .replace(/[^\u0600-\u06FFa-zA-Z0-9 ]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -406,11 +423,27 @@ export function isOutOfScopeQuestion(text: string, priorUserText: string): boole
 
 /** Source-backed extractive fallback: only verbatim retrieved passages with their
  * real citations. Used when no model citation can be verified. */
-export function buildExtractiveFallback(sources: RagSource[]): string {
+// Contiguous verbatim window of ~500 chars starting just before the first key-term hit (diacritics tolerated), so the shown text is where the match is.
+export function windowAround(clean: string, keywords: string[]): string {
+  if (clean.length <= 500) return clean;
+  const D = '[\\u064B-\\u0652\\u0640]*';
+  let best = -1;
+  for (const k of keywords) {
+    const st = normalizeArabic(k).replace(/^ال/, '');
+    if (st.length < 3) continue;
+    const re = new RegExp(st.split('').map(c => c === 'ه' ? '[هة]' : c === 'ا' ? '[اأإآ]' : c === 'ي' ? '[يى]' : c).join(D));
+    const m = re.exec(clean);
+    if (m && (best < 0 || m.index < best)) best = m.index;
+  }
+  if (best < 0) return clean.slice(0, 500);
+  const start = Math.max(0, best - 120);
+  return (start > 0 ? '…' : '') + clean.slice(start, start + 500);
+}
+export function buildExtractiveFallback(sources: RagSource[], keywords: string[] = []): string {
   const parts = sources.slice(0, 3).map(s => {
     const clean = s.text.replace(/\s+/g, ' ').trim();
     const cut = clean.length > 500;
-    return `${s.citationMarkdown}\n«${cut ? clean.slice(0, 500) : clean}${cut ? '…' : ''}»`;
+    return `${s.citationMarkdown}\n«${cut ? windowAround(clean, keywords) : clean}${cut ? '…' : ''}»`;
   });
   return 'لا أملك إجابة موثقة على هذا السؤال من المصادر المعتمدة. الفقرات التالية نتيجة بحث نصي آلي، وقد لا تتعلق بسؤالك؛ تُعرض للاستئناس فقط ولا تُعد إجابة:\n\n'
     + parts.join('\n\n')
@@ -419,9 +452,9 @@ export function buildExtractiveFallback(sources: RagSource[]): string {
 
 /** Model-outage response: explicitly no generated answer; only verbatim retrieved
  * passages with their exact citations. */
-export function buildOutageFallback(sources: RagSource[]): string {
+export function buildOutageFallback(sources: RagSource[], keywords: string[] = []): string {
   return 'خوادم التوليد مضغوطة حالياً، فلا أقدّم إجابة مولّدة. هذه فقرات مسترجعة حرفياً من المصادر المعتمدة بتوثيقها الدقيق عبر بحث نصي آلي، وقد لا تتعلق بسؤالك:\n\n'
-    + buildExtractiveFallback(sources).split('\n\n').slice(1).join('\n\n');
+    + buildExtractiveFallback(sources, keywords).split('\n\n').slice(1).join('\n\n');
 }
 
 
@@ -591,6 +624,7 @@ app.post('/api/chat', async (req, res) => {
 
   let rag: Awaited<ReturnType<typeof retrieveEvidence>> = { ok: false, reason: 'upstream' };
   let trivial = false;
+  let lastRelKeywords: string[] = [];
   let relevantCount = -1; // -1: relevance not assessed
   let relevantKeys: Set<string> | null = null;
   try {
@@ -649,6 +683,7 @@ app.post('/api/chat', async (req, res) => {
     const queryTokens = normalizeArabic(lastUserText).split(' ').filter(t => t.length >= 3 && !GENERIC_STOP.has(t) && !DIALECT_STOP.has(t) && !DIALECT_MAP[t]);
     // keywords: model's standard-Arabic terms; else dictionary terms; else the question's own content words
     const relKeywords = (und && und.keywords.length) ? und.keywords : (dia.keywords.length ? dia.keywords : queryTokens.slice(0, 5));
+    lastRelKeywords = relKeywords;
     const queries = msaQuery ? [msaQuery, lastUserText] : [lastUserText];
     const tRet0 = Date.now();
     rag = await retrieveMulti(queries, 8000);
@@ -661,7 +696,7 @@ app.post('/api/chat', async (req, res) => {
       const relSet = new Set(rel);
       rag = { ok: true, sources: [...rel, ...rag.sources.filter(x => !relSet.has(x))].slice(0, 15) };
       relevantCount = rel.length;
-      relevantKeys = new Set(rel.map(x => x.book_id + ':' + x.page_id));
+      relevantKeys = new Set(strongRelevant(rel, relKeywords).map(x => x.book_id + ':' + x.page_id));
     }
     if (!rag.ok && !trivial) {
       const msg = rag.reason === 'empty'
@@ -877,7 +912,7 @@ app.post('/api/chat', async (req, res) => {
         console.log(`model outage: serving retrieval-only fallback (no generated answer) relevant=${relevantCount}`);
         const shown = relevantKeys ? rag.sources.filter(x => relevantKeys!.has(x.book_id + ':' + x.page_id)) : rag.sources;
         const outText = shown.length > 0
-          ? buildOutageFallback(shown)
+          ? buildOutageFallback(shown, lastRelKeywords)
           : 'خوادم التوليد مضغوطة حالياً، فلا أقدّم إجابة مولّدة. والبحث النصي لم يُرجع فقرات تشترك مع كلمات سؤالك المفتاحية. هذا لا يعني أن المصادر المعتمدة تخلو من الجواب؛ أعد المحاولة بعد قليل أو جرّب صياغة أخرى.';
         res.write(`data: ${JSON.stringify({ text: outText })}\n\n`);
         res.write('data: [DONE]\n\n');
