@@ -487,11 +487,20 @@ export function isContestedTopic(q: string): boolean {
 export function buildExcerptMode(sources: RagSource[], keywords: string[]): string {
   const lab = (t: string) => t.replace(/\s+/g, ' ').replace(/(^|\s)س\s*:/g, '$1[سؤال السائل: سياق وليس حكماً] ').replace(/(^|\s)ج\s*:/g, '\n[جواب العالم] ');
   const strong = new Set(strongRelevant(sources, keywords).map(x => x.book_id + ':' + x.page_id));
-  const pick = [...sources.filter(x => strong.has(x.book_id + ':' + x.page_id)), ...sources.filter(x => !strong.has(x.book_id + ':' + x.page_id))].slice(0, 4);
+  const pick = keywords.length > 0 ? sources.filter(x => strong.has(x.book_id + ':' + x.page_id)).slice(0, 4) : [];
+  if (pick.length === 0) return 'هذه مسألة خلافية، ولن أصوغ فيها حكماً بكلامي. لم أجد في المصادر المعتمدة نصاً مطابقاً لصياغة سؤالك. جرّب صياغة أقرب لعنوان الفتوى (مثل «حكم الزواج من امرأة لا تصلي»)، أو راجع عالماً ثقة.';
   const parts = pick.map(x => {
     const clean = lab(x.text.trim());
-    const cut = clean.length > 1500;
-    return `${x.citationMarkdown}\n«${cut ? clean.slice(0, 1500) + '…' : clean}»`;
+    if (clean.length <= 1500) return `${x.citationMarkdown}\n«${clean}»`;
+    // Long passage: keep the asker's question (shortened, marked) AND the start of the scholar's answer, and say so.
+    const ai = clean.indexOf('[جواب العالم]');
+    if (ai > 0) {
+      const q = clean.slice(0, ai).trim();
+      const qs = q.length > 450 ? q.slice(0, 450) + ' […اختُصر نص السؤال هنا]' : q;
+      const ans = clean.slice(ai, ai + 1000);
+      return `${x.citationMarkdown}\n«${qs}\n${ans}${clean.length > ai + 1000 ? ' […اقتُطع باقي النص، راجع المصدر الكامل في الرابط]' : ''}»`;
+    }
+    return `${x.citationMarkdown}\n«${clean.slice(0, 1500)} […اقتُطع باقي النص، راجع المصدر الكامل في الرابط]»`;
   });
   return 'هذه مسألة خلافية، ولذلك أعرض لك نصوص المصادر نفسها كما وردت بدل أن أصوغ لك حكماً بكلامي. هذه مقتطفات من المصادر المسترجعة وليست إجابة مُركّبة؛ وهي نتيجة بحث آلي قد لا ينطبق بعضها على حالتك. انتبه لعبارات الخلاف والقيود الواردة فيها مثل «على الصحيح» و«وعند آخرين»، ولما بعد «سؤال السائل» فهو كلام السائل لا العالم، ولحالة السائل فقد تختلف عن حالتك. راجع عالماً ثقة في حالتك.\n\n'
     + parts.join('\n\n');
