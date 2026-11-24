@@ -557,6 +557,24 @@ export function validateAnswerCitations(answer: string, sources: RagSource[]): V
   return { text: answer, hadCitations, verifiedUnits, droppedCards, removedSpans, droppedLinks };
 }
 
+/** Deterministic gate for a vague personal wish ("عاوز اتجوز") on the first turn: ask one short clarifying question
+ * instead of answering with unrelated rulings. No model call, no sources, no religious claims. Returns null otherwise. */
+export function vagueWishClarification(text: string, turnCount: number): string | null {
+  if (turnCount > 1) return null;
+  const toks = normalizeArabic(text).split(' ').filter(Boolean);
+  if (toks.length < 2 || toks.length > 3) return null;
+  const INTENT = new Set(['عاوز', 'عايز', 'عاوزه', 'عايزه', 'نفسي', 'اريد', 'ابغي', 'ابي', 'احب', 'ودي', 'ناوي', 'ناويه']);
+  if (!INTENT.has(toks[0])) return null;
+  const QUESTION = ['حكم', 'هل', 'كيف', 'ازاي', 'شروط', 'يجوز', 'ليه', 'لماذا', 'ماذا', 'معني', 'تفسير', 'دليل', 'حلال', 'حرام', 'اعرف', 'اسال', 'اتعلم', 'افهم', 'عن', 'ايه', 'اي'];
+  if (toks.some(t => QUESTION.includes(t))) return null;
+  const rest = toks.slice(1);
+  const dia = dialectExpand(rest.join(' '));
+  if (dia.keywords.some(k => k === 'زواج' || k === 'نكاح')) {
+    return 'ربنا ييسّر أمرك. عشان أفيدك صح: تقصد إيه بالظبط؟\n- شروط عقد الزواج وأركانه (الولي، الشهود، المهر)\n- الخطبة والنظر للمخطوبة\n- اختيار الزوج أو الزوجة\n- آداب الزواج والوليمة\n- موقف أو مشكلة معينة (احكيلي التفاصيل)\n\nاكتب اللي يهمّك وأنا أجاوبك من المصادر المعتمدة.';
+  }
+  return 'ممكن توضّح أكتر؟ سؤالك «' + text.trim() + '» عام، وأنا مش عايز أرد بنصوص مالهاش علاقة. اكتب سؤالك الشرعي بشكل محدد (مثلاً: ما حكم كذا؟ أو ما شروط كذا؟ أو موقف معيّن حصل معاك) وأجاوبك من المصادر المعتمدة.';
+}
+
 /** Greetings / very short small-talk skip retrieval and the abstention rule. */
 function isTrivialMessage(text: string): boolean {
   const t = text.trim();
@@ -651,6 +669,14 @@ app.post('/api/chat', async (req, res) => {
     // (no authoritative religious answer without reliable evidence).
     const lastUserText = [...contents].reverse().find(c => c.role === 'user')?.parts[0]?.text || '';
     trivial = isTrivialMessage(lastUserText);
+    const wishClar = vagueWishClarification(lastUserText, contents.length);
+    if (wishClar) {
+      console.log('timing vague-wish clarification (no model, no retrieval)');
+      res.write(`data: ${JSON.stringify({ text: wishClar })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
     // Deterministic scope gate: non-religious questions are declined outright
     // rather than answered from tangentially retrieved texts.
     const priorUserText = [...contents].reverse().filter(c => c.role === 'user').slice(1, 3).map(c => c.parts[0]?.text || '').join(' ');
