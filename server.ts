@@ -241,14 +241,14 @@ export function dialectExpand(text: string): { msaQuery: string; keywords: strin
 
 let understandBlockedUntil = 0; // skip the rewrite call briefly after it failed (avoids stacking latency in a provider wave)
 
-export interface Understanding { inScope: boolean; msa: string; keywords: string[]; }
+export interface Understanding { inScope: boolean; msa: string; keywords: string[]; alts: string[]; }
 
 async function understandQuestion(ai: GoogleGenAI, text: string, prior: string, budgetMs = 6000): Promise<Understanding | null> {
   const prompt = `أنت مصنّف ومحرّر استعلامات لمساعد شرعي. المستخدم يكتب غالباً بالعامية المصرية.
 السؤال الحالي: «${text.slice(0, 600)}»
 ${prior ? `سياق سابق من المستخدم: «${prior.slice(0, 400)}»` : ''}
 أعد JSON فقط بهذا الشكل:
-{"in_scope": true|false, "msa": "<السؤال بالعربية الفصحى الفقهية الواضحة مع حل الإحالات من السياق>", "keywords": ["<٢ إلى ٦ كلمات مفتاحية فصيحة كما ترد في كتب الفقه والحديث، بجذورها وصيغها الشائعة، مثل: زواج، نكاح، تزوج>"]}
+{"in_scope": true|false, "msa": "<السؤال بالعربية الفصحى الفقهية الواضحة مع حل الإحالات من السياق>", "keywords": ["<٢ إلى ٦ كلمات مفتاحية فصيحة كما ترد في كتب الفقه والحديث، بجذورها وصيغها الشائعة، مثل: زواج، نكاح، تزوج>"], "alts": ["<عبارتان قصيرتان (٣ إلى ٧ كلمات) بصيغة عناوين الفتاوى كما يكتبها العلماء عادةً، بأشهر أفعال المسألة وصيغها، مثل: «حكم الزواج من امرأة لا تصلي» وليس «لا تقيم الصلاة»>"]}
 in_scope تكون true لأي سؤال عن الدين الإسلامي أو الفقه أو العقيدة أو الحديث أو التفسير أو السيرة أو الأخلاق الشرعية أو معاملات الحياة من منظور شرعي (وإن كُتب بالعامية)، وfalse لغير ذلك (برمجة، رياضة، جغرافيا، ترفيه...). لا تفسّر بأكثر من JSON.`;
   const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash'];
   const deadline = Date.now() + budgetMs;
@@ -265,7 +265,8 @@ in_scope تكون true لأي سؤال عن الدين الإسلامي أو ا�
       const kws: string[] = Array.isArray(j.keywords) ? j.keywords.map((k: any) => String(k)).filter((k: string) => k.length >= 2).slice(0, 8) : [];
       const msa = typeof j.msa === 'string' ? j.msa.trim().slice(0, 400) : '';
       if (typeof j.in_scope !== 'boolean') continue;
-      return { inScope: j.in_scope, msa, keywords: kws };
+      const alts: string[] = Array.isArray(j.alts) ? j.alts.map((a: any) => String(a).trim().slice(0, 120)).filter((a: string) => a.length >= 6).slice(0, 2) : [];
+      return { inScope: j.in_scope, msa, keywords: kws, alts };
     } catch {
       /* try next model / give up quietly */
     }
@@ -305,9 +306,16 @@ async function retrieveMulti(queries: string[], budgetMs = 8000): Promise<Retrie
   const seen = new Set<string>();
   const merged: RagSource[] = [];
   let anyUpstream = false;
+  // Round-robin across the queries so every phrasing contributes its best passages (not just the first query's).
+  const lists: RagSource[][] = [];
   for (const r of results) {
     if (!r.ok) { if (r.reason !== 'empty') anyUpstream = true; continue; }
-    for (const src of r.sources) {
+    lists.push(r.sources);
+  }
+  for (let i = 0; lists.some(l => i < l.length); i++) {
+    for (const l of lists) {
+      const src = l[i];
+      if (!src) continue;
       const key = src.book_id + ':' + src.page_id;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -327,7 +335,8 @@ const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان �
 - لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.
 - إن كانت رسالة المستخدم رغبة أو جملة عامة غير محددة (مثل «عاوز أتجوز» أو «عايز أتوب») وليست مسألة شرعية واضحة، فلا تسرد أحكاماً غير مرتبطة بها؛ اسأل سؤالاً توضيحياً واحداً قصيراً بلغة المستخدم عمّا يريد معرفته (شروط؟ آداب؟ خطوات؟) واذكر باختصار ما يمكنك المساعدة فيه، ولا تخترع نصوصاً.
 - إن لم تتعلق الفقرات المسترجعة بسؤال المستخدم فعلاً، فقل ذلك صراحة ولا تستشهد بها.
-- إذا ذكرت الفقرة خلافاً بين العلماء (مثل «على الصحيح» أو «وعند آخرين» أو «الأحوط» أو «اختلاف») فاذكر الخلاف وقيد الحكم بنطاقه وشرطه كما ورد، ولا تعمّم القول الراجح عند عالم بعينه على أنه حكم متفق عليه. ولا تقل «أجمع أهل العلم» أو «بالإجماع» أو «عند الجمهور» إلا إذا نصّت الفقرة المسترجعة نفسها على ذلك. انسب كل قول لقائله وكتابه كما ورد في الفقرة.`;
+- إذا ذكرت الفقرة خلافاً بين العلماء (مثل «على الصحيح» أو «وعند آخرين» أو «الأحوط» أو «اختلاف») فاذكر الخلاف وقيد الحكم بنطاقه وشرطه كما ورد، ولا تعمّم القول الراجح عند عالم بعينه على أنه حكم متفق عليه. ولا تقل «أجمع أهل العلم» أو «بالإجماع» أو «عند الجمهور» إلا إذا نصّت الفقرة المسترجعة نفسها على ذلك. انسب كل قول لقائله وكتابه كما ورد في الفقرة.
+- انتبه لحالة السائل في الفقرة: إن كانت الفقرة تجيب عن حالة مختلفة عن حالة المستخدم (مثل عقد نكاح قائم منذ سنوات مقابل زواج لم يتم بعد، أو جهل مقابل تهاون) فلا تطبّقها على المستخدم كأنها حكم مسألته؛ اذكر الفرق صراحة، أو اطلب منه توضيح حالته بسؤال واحد قصير. ولا تملأ الجواب بنصائح عامة غير موثقة بدل الجواب.`;
 
 /* ---- Server-side citation validation: no citation is presented as verified
  * unless it is backed by text actually retrieved in THIS request. ---- */
@@ -728,7 +737,7 @@ app.post('/api/chat', async (req, res) => {
     // keywords: model's standard-Arabic terms; else dictionary terms; else the question's own content words
     const relKeywords = (und && und.keywords.length) ? und.keywords : (dia.keywords.length ? dia.keywords : queryTokens.slice(0, 5));
     lastRelKeywords = relKeywords;
-    const queries = msaQuery ? [msaQuery, lastUserText] : [lastUserText];
+    const queries = msaQuery ? [msaQuery, ...((und && und.alts) || []), lastUserText] : [lastUserText];
     const tRet0 = Date.now();
     rag = await retrieveMulti(queries, 8000);
     const tRetrieve = Date.now() - tRet0;
