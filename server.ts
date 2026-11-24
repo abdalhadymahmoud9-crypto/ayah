@@ -215,9 +215,10 @@ const DIALECT_MAP: Record<string, string> = {
   'فلوس': 'مال', 'فايده': 'ربا فائده', 'الفايده': 'ربا فائده', 'بنك': 'ربا بنوك', 'البنك': 'ربا بنوك',
   'سجاير': 'تدخين', 'سيجاره': 'تدخين', 'شيشه': 'تدخين', 'اغاني': 'غناء معازف', 'الاغاني': 'غناء معازف',
   'موسيقي': 'معازف غناء', 'الموسيقي': 'معازف غناء', 'تصوير': 'تصوير صور', 'حجاب': 'حجاب خمار',
+  'جزمه': 'حذاء نعل خف', 'اصلي': 'صلاه صلي', 'هصلي': 'صلاه صلي', 'اصوم': 'صيام صوم', 'افطر': 'افطار صيام', 'لابس': 'لبس', 'جزمتي': 'حذاء نعل خف',
   'ينفع': 'يجوز', 'ازاي': 'كيف', 'اقرا': 'قراءه', 'ادعي': 'دعاء',
 };
-const DIALECT_STOP = new Set(['عاوز', 'عايز', 'عاوزه', 'عايزه', 'ينفع', 'ازاي', 'يعني', 'وكان', 'سؤال', 'لو', 'انا', 'ده', 'دي']);
+const DIALECT_STOP = new Set(['عاوز', 'عايز', 'عاوزه', 'عايزه', 'ينفع', 'ازاي', 'يعني', 'وكان', 'وانا', 'انا', 'عليا', 'سؤال', 'لو', 'انا', 'ده', 'دي']);
 const KEYWORD_SKIP = new Set(['كيف', 'يجوز']);
 
 export function dialectExpand(text: string): { msaQuery: string; keywords: string[]; hit: boolean } {
@@ -307,7 +308,8 @@ function buildEvidenceBlock(sources: RagSource[]): string {
   return `نصوص موثقة مسترجعة من المكتبة الشاملة (المصدر الوحيد الجائز للنقل الحرفي والتوثيق):\n\n${items}`;
 }
 
-const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط)، وأرفق رابط الشاملة الكامل نفسه في خانة الموضع لكل مرجع؛ فالمرجع بلا رابط يُحذف آلياً.\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.`;
+const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط)، وأرفق رابط الشاملة الكامل نفسه في خانة الموضع لكل مرجع؛ فالمرجع بلا رابط يُحذف آلياً.\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- كل معلومة أو نسبة لعالم أو كتاب تذكرها خارج علامات الاقتباس يجب أن تكون مما ورد صراحة في الفقرات المسترجعة؛ لا تضف تفصيلاً أو عزواً أو اسم كتاب لم يرد فيها، وإن لم يرد فصرّح بأنه لم يرد في المصادر المسترجعة.
+- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.`;
 
 /* ---- Server-side citation validation: no citation is presented as verified
  * unless it is backed by text actually retrieved in THIS request. ---- */
@@ -392,6 +394,8 @@ const RELIGIOUS_TERMS = [
   'نبوه', 'رساله', 'صحابه', 'التابعين', 'عذاب', 'جنه', 'نار', 'آخرة', 'اخره', 'ميعاد',
 ];
 
+const OOS_TOPICS = ['برمجه', 'كود ', 'بايثون', 'جافاسكربت', 'كره القدم', 'كره السله', 'فريق', 'مباراه', 'عاصمه', 'فيلم', 'مسلسل', 'وصفه', 'طبخ', 'الطقس', 'سعر الدولار', 'اسهم', 'ريال مدريد', 'برشلونه'];
+
 /** Deterministic scope gate: only religious/Islamic questions are in scope. */
 export function isOutOfScopeQuestion(text: string, priorUserText: string): boolean {
   const t = normalizeArabic(text + ' ' + priorUserText);
@@ -418,6 +422,33 @@ export function buildExtractiveFallback(sources: RagSource[]): string {
 export function buildOutageFallback(sources: RagSource[]): string {
   return 'خوادم التوليد مضغوطة حالياً، فلا أقدّم إجابة مولّدة. هذه فقرات مسترجعة حرفياً من المصادر المعتمدة بتوثيقها الدقيق عبر بحث نصي آلي، وقد لا تتعلق بسؤالك:\n\n'
     + buildExtractiveFallback(sources).split('\n\n').slice(1).join('\n\n');
+}
+
+
+/** Remove "(كما في X)" style attributions naming a book that was not retrieved in this request. */
+export function stripUnsupportedAttributions(text: string, sources: RagSource[]): { text: string; removed: number } {
+  const GENERIC = new Set(['تفسير', 'كتاب', 'جامع', 'بيان', 'مجموع', 'شرح', 'فتاوي', 'فتاوى', 'سنن', 'صحيح']);
+  const titleTokens = new Set<string>();
+  for (const src of sources) {
+    const m = src.citationMarkdown.match(/^\[([^\]]+?)(?:\s*\(|\])/);
+    const title = m ? m[1] : '';
+    for (const t of normalizeArabic(title).split(' ')) {
+      const k = t.replace(/^ال/, '');
+      if (k.length >= 3 && !GENERIC.has(k)) titleTokens.add(k);
+    }
+  }
+  let removed = 0;
+  const out = text.replace(/\((?:كما في|انظر|ينظر|ذكره في|وانظر)\s+([^)\n]{3,140})\)/g, (full, inner: string) => {
+    const segs = inner.split(/\s+و(?=\S)|،|,/).map(x => x.trim()).filter(Boolean);
+    const kept = segs.filter(seg => normalizeArabic(seg).split(' ').some(t => {
+      const k = t.replace(/^ال/, '');
+      return k.length >= 3 && !GENERIC.has(k) && titleTokens.has(k);
+    }));
+    if (kept.length === segs.length) return full;
+    removed += segs.length - kept.length;
+    return kept.length > 0 ? `(كما في ${kept.join(' و')})` : '';
+  });
+  return { text: out, removed };
 }
 
 export function validateAnswerCitations(answer: string, sources: RagSource[]): ValidationResult {
@@ -598,7 +629,11 @@ app.post('/api/chat', async (req, res) => {
     }
     const tUnderstand = Date.now() - tStart;
     // Scope: the model's classification when available; keyword gate only when it is not.
-    const outOfScope = und ? !und.inScope : !kwInScope;
+    // Model down: refuse only when the keyword gate misses AND the question names a clearly non-religious topic;
+    // otherwise proceed (the relevance display filter handles junk) so in-scope colloquial questions are not wrongly refused.
+    const normQ = normalizeArabic(lastUserText);
+    const oosTopicHit = OOS_TOPICS.some(t => normQ.includes(t));
+    const outOfScope = und ? !und.inScope : (!kwInScope && oosTopicHit);
     if (!trivial && outOfScope) {
       const msg = 'هذا المساعد مخصص للمسائل الشرعية والعلوم الإسلامية فقط، وسؤالك خارج هذا النطاق. اسأل عن مسألة شرعية أو عقدية أو من علوم الدين.';
       res.write(`data: ${JSON.stringify({ text: msg })}\n\n`);
@@ -802,6 +837,8 @@ app.post('/api/chat', async (req, res) => {
         console.log(`citation validation: droppedCards=${v.droppedCards} removedSpans=${v.removedSpans} droppedLinks=${v.droppedLinks} verified=${v.verifiedUnits}`);
       }
       finalText = v.text;
+      const att = stripUnsupportedAttributions(finalText, ragSources);
+      if (att.removed) { console.log(`attribution check: removed ${att.removed} unsupported book attribution(s)`); finalText = att.text; }
       if (!trivial && v.verifiedUnits === 0 && ragSources.length > 0) {
         const shownX = relevantKeys ? ragSources.filter(x => relevantKeys!.has(x.book_id + ':' + x.page_id)) : ragSources;
         finalText = shownX.length > 0 ? buildExtractiveFallback(shownX) : 'لا أملك إجابة موثقة على هذا السؤال، والبحث النصي لم يُرجع فقرات تشترك مع كلمات سؤالك المفتاحية. هذا لا يعني أن المصادر المعتمدة تخلو من الجواب؛ جرّب صياغة أخرى للسؤال.';
