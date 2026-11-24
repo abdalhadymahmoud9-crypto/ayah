@@ -172,9 +172,11 @@ app.post('/api/chat', async (req, res) => {
     let stream: any = null;
     let fallbackText: string | null = null;
     let lastError: any = null;
+    let wroteAny = false;
 
     for (const model of candidateModels) {
       if (isAborted) break;
+      stream = null;
 
       for (let attempt = 0; attempt < 2; attempt++) {
         if (isAborted) break;
@@ -208,9 +210,55 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-      if (stream) break;
+      // If streaming was established, stream chunks out.
+      // A mid-stream failure or stall must NOT finalize a partial answer:
+      // - if nothing was sent to the client yet, fall through to the next model;
+      // - if partial text already went out, tell the client the answer was
+      //   interrupted so it shows an error instead of a fake-complete reply.
+      if (stream) {
+        let chunkTimer: ReturnType<typeof setTimeout> | null = null;
+        const CHUNK_TIMEOUT_MS = 45000;
+        try {
+          const iterator = stream[Symbol.asyncIterator]();
+          while (true) {
+            if (isAborted) break;
+            const timeoutPromise = new Promise<never>((_, reject) => {
+              chunkTimer = setTimeout(() => {
+                const e: any = new Error('No chunk received within ' + CHUNK_TIMEOUT_MS + 'ms');
+                e.status = 'CHUNK_TIMEOUT';
+                reject(e);
+              }, CHUNK_TIMEOUT_MS);
+            });
+            const next = await Promise.race([iterator.next(), timeoutPromise]);
+            if (chunkTimer) clearTimeout(chunkTimer);
+            if (next.done) break;
+            const text = next.value?.text;
+            if (text) {
+              res.write(`data: ${JSON.stringify({ text })}\n\n`);
+              wroteAny = true;
+            }
+          }
+          stream = null; // consumed successfully
+          break;
+        } catch (streamErr: any) {
+          if (chunkTimer) clearTimeout(chunkTimer);
+          lastError = streamErr;
+          console.error('Error during chunk streaming:', streamErr);
+          stream = null;
+          if (wroteAny) {
+            const st = streamErr?.status || streamErr?.code;
+            const friendly = 'انقطع الاتصال بالنموذج أثناء توليد الإجابة' +
+              (st ? ` (رمز الخطأ: ${st})` : '') +
+              '. هذه ليست إجابة مكتملة، يرجى إعادة إرسال سؤالك.';
+            res.write(`data: ${JSON.stringify({ error: friendly })}\n\n`);
+            res.end();
+            return;
+          }
+          // Nothing was written for this model; try non-streaming fallback below, then next model.
+        }
+      }
 
-      // If stream couldn't be initialized, try standard non-streaming generateContent on this model
+      // If streaming failed before any output, try standard non-streaming generateContent on this model
       try {
         const directRes = await ai.models.generateContent({
           model,
@@ -228,21 +276,7 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    // If streaming was established, stream chunks out
-    if (stream) {
-      try {
-        for await (const chunk of stream) {
-          if (isAborted) break;
-          const text = chunk.text;
-          if (text) {
-            res.write(`data: ${JSON.stringify({ text })}\n\n`);
-          }
-        }
-      } catch (streamErr: any) {
-        // If stream broke mid-way, log and end
-        console.error('Error during chunk streaming:', streamErr);
-      }
-    } else if (fallbackText) {
+    if (fallbackText) {
       // Chunk out the fallback text smoothly
       const chunkSize = 20;
       for (let i = 0; i < fallbackText.length; i += chunkSize) {
@@ -250,7 +284,7 @@ app.post('/api/chat', async (req, res) => {
         const slice = fallbackText.slice(i, i + chunkSize);
         res.write(`data: ${JSON.stringify({ text: slice })}\n\n`);
       }
-    } else {
+    } else if (!wroteAny) {
       let friendlyError = 'تعذر الوصول إلى نماذج الذكاء الاصطناعي حالياً، يرجى المحاولة بعد لحظات.';
       const errMsg = lastError?.message || '';
       if (lastError?.status === 429 || errMsg.includes('Quota exceeded') || errMsg.includes('RESOURCE_EXHAUSTED')) {
