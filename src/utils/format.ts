@@ -109,7 +109,8 @@ export function formatContent(rawText: string): FormattedMessage {
     .replace(/^#+\s*(.+)$/gm, '<b>$1</b>')
     .replace(/^[-*]\s+(.+)$/gm, '• $1')
     .replace(/﴿([^﴾]+)﴾/g, '<span class="ayah">﴿$1﴾</span>')
-    .replace(/«([^»]+)»/g, '<span class="matn-quote">«$1»</span>');
+    .replace(/«([^»]+)»/g, '<span class="matn-quote">«$1»</span>')
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 
   html = html.replace(/\n/g, '<br>');
 
