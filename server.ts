@@ -313,6 +313,13 @@ export function buildExtractiveFallback(sources: RagSource[]): string {
     + '\n\nإن لم تنص هذه الفقرات على جواب مسألتك، فالمراجع المتاحة لم تنص عليه.';
 }
 
+/** Model-outage response: explicitly no generated answer; only verbatim retrieved
+ * passages with their exact citations. */
+export function buildOutageFallback(sources: RagSource[]): string {
+  return 'خوادم التوليد مضغوطة حالياً، فلا أقدّم إجابة مولّدة. هذه أقرب الفقرات المسترجعة حرفياً من المصادر المعتمدة بتوثيقها الدقيق، وقد لا تنص على جواب مسألتك:\n\n'
+    + buildExtractiveFallback(sources).split('\n\n').slice(1).join('\n\n');
+}
+
 export function validateAnswerCitations(answer: string, sources: RagSource[]): ValidationResult {
   const rsrc = buildRetrievedSources(sources);
   const allHaystack = rsrc.map(s => s.haystack).join(' ');
@@ -451,6 +458,8 @@ app.post('/api/chat', async (req, res) => {
     }
   });
 
+  let rag: Awaited<ReturnType<typeof retrieveEvidence>> = { ok: false, reason: 'upstream' };
+  let trivial = false;
   try {
     const ai = new GoogleGenAI({
       apiKey,
@@ -474,7 +483,7 @@ app.post('/api/chat', async (req, res) => {
     // On empty results or retrieval outage: abstain without calling the model
     // (no authoritative religious answer without reliable evidence).
     const lastUserText = [...contents].reverse().find(c => c.role === 'user')?.parts[0]?.text || '';
-    const trivial = isTrivialMessage(lastUserText);
+    trivial = isTrivialMessage(lastUserText);
     // Deterministic scope gate: non-religious questions are declined outright
     // rather than answered from tangentially retrieved texts.
     const priorUserText = [...contents].reverse().filter(c => c.role === 'user').slice(1, 3).map(c => c.parts[0]?.text || '').join(' ');
@@ -487,7 +496,7 @@ app.post('/api/chat', async (req, res) => {
     }
     // Always retrieve: even greetings get real evidence, so the model never has to
     // cite from memory. Abstention applies only to non-trivial messages.
-    const rag = await retrieveEvidence(lastUserText, 8000);
+    rag = await retrieveEvidence(lastUserText, 8000);
     if (!rag.ok && !trivial) {
       const msg = rag.reason === 'empty'
         ? 'لم أجد هذه المسألة في المراجع المعتمدة المتاحة حالياً، ولن أجيب إلا عن نص موثق منها. جرّب صياغة أخرى، أو اسأل عن مسألة من مسائل العلم المدوّنة في الكتب المعتمدة.'
@@ -557,13 +566,9 @@ app.post('/api/chat', async (req, res) => {
             break;
           }
 
-          // If 503 high demand spike, retry after a short pause
-          if (status === 503 || msg.includes('high demand') || msg.includes('UNAVAILABLE')) {
-            if (attempt === 0) {
-              await new Promise(r => setTimeout(r, 600));
-              continue;
-            }
-          }
+          // 503 high demand: the model is overloaded; move straight to the next
+          // model instead of retrying the same one (measured: retries during a
+          // wave fail again, and burn ~2s per attempt).
           break;
         }
       }
@@ -621,8 +626,13 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-      // If streaming failed before any output, try standard non-streaming generateContent on this model
-      if (Date.now() <= deadline) {
+      // If streaming failed before any output, try standard non-streaming generateContent on this model.
+      // Skip when the failure was 503/429: the same model is overloaded or out of quota,
+      // so a second call to it only adds latency (measured) without a realistic chance.
+      const st = lastError?.status || lastError?.code;
+      const m = lastError?.message || '';
+      const overloaded = st === 503 || st === 429 || m.includes('high demand') || m.includes('UNAVAILABLE') || m.includes('Quota exceeded');
+      if (Date.now() <= deadline && !overloaded) {
         try {
           const directRes = await Promise.race([
             ai.models.generateContent({
@@ -692,6 +702,15 @@ app.post('/api/chat', async (req, res) => {
   } catch (error: any) {
     console.error('Error in /api/chat:', error);
     if (!res.writableEnded) {
+      // Graceful degradation: on model outage with retrieved evidence, return the
+      // verbatim retrieved passages with exact citations and no generated answer.
+      if (!trivial && rag.ok && rag.sources.length > 0) {
+        console.log('model outage: serving retrieval-only fallback (no generated answer)');
+        res.write(`data: ${JSON.stringify({ text: buildOutageFallback(rag.sources) })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
       const errorMessage = error?.message || 'حدث خطأ غير متوقع أثناء معالجة السؤال.';
       res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
       res.end();
