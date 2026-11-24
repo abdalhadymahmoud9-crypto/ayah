@@ -313,6 +313,11 @@ async function retrieveMulti(queries: string[], budgetMs = 8000): Promise<Retrie
     if (!r.ok) { if (r.reason !== 'empty') anyUpstream = true; continue; }
     lists.push(r.sources);
   }
+  // Reserved slots: the user's own phrasing (last query) keeps its top 3 hits so exact-phrasing matches are not crowded out.
+  if (results.length > 1) {
+    const rawRes = results[results.length - 1];
+    if (rawRes.ok) for (const src of rawRes.sources.slice(0, 3)) { const k = src.book_id + ':' + src.page_id; if (!seen.has(k)) { seen.add(k); merged.push(src); } }
+  }
   for (let i = 0; lists.some(l => i < l.length); i++) {
     for (const l of lists) {
       const src = l[i];
@@ -328,7 +333,9 @@ async function retrieveMulti(queries: string[], budgetMs = 8000): Promise<Retrie
 }
 
 function buildEvidenceBlock(sources: RagSource[]): string {
-  const items = sources.map((s, i) => `[${i + 1}] ${s.citationMarkdown}\n${s.text}`).join('\n\n');
+  // Label asker context vs scholar answer in fatwa-format passages; nothing is removed.
+  const label = (t: string) => t.replace(/(^|\n)\s*س\s*:/g, '$1[سياق السائل وافتراضه، وليس حكم العالم] ').replace(/(^|\n)\s*ج\s*:/g, '$1[جواب العالم] ');
+  const items = sources.map((s, i) => `[${i + 1}] ${s.citationMarkdown}\n${label(s.text)}`).join('\n\n');
   return `نصوص موثقة مسترجعة من المكتبة الشاملة (المصدر الوحيد الجائز للنقل الحرفي والتوثيق):\n\n${items}`;
 }
 
