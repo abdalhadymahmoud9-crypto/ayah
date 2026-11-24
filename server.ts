@@ -241,7 +241,7 @@ export function dialectExpand(text: string): { msaQuery: string; keywords: strin
 
 let understandBlockedUntil = 0; // skip the rewrite call briefly after it failed (avoids stacking latency in a provider wave)
 
-const DIAG_ENABLED = true; // public diagnostic payload disabled by default (privacy review)
+const DIAG_ENABLED = false; // public diagnostic payload disabled by default (privacy review)
 export interface Understanding { inScope: boolean; msa: string; keywords: string[]; alts: string[]; }
 
 async function understandQuestion(ai: GoogleGenAI, text: string, prior: string, budgetMs = 6000): Promise<Understanding | null> {
@@ -469,6 +469,32 @@ export function buildExtractiveFallback(sources: RagSource[], keywords: string[]
   return 'لا أملك إجابة موثقة على هذا السؤال من المصادر المعتمدة. الفقرات التالية نتيجة بحث نصي آلي، وقد لا تتعلق بسؤالك؛ تُعرض للاستئناس فقط ولا تُعد إجابة:\n\n'
     + parts.join('\n\n')
     + '\n\nهذه نتائج بحث بالكلمات وليست حكماً على المصادر: عدم ظهور جواب فيها لا يعني أن المصادر المعتمدة تخلو منه.';
+}
+
+
+/** Conservative "source excerpts" mode for a SMALL, explicit list of contested-ruling topics. Deterministic trigger (regex on the normalized
+ * question), not a safety classification: topics outside the list are NOT guaranteed safe and still use model generation. */
+export function isContestedTopic(q: string): boolean {
+  const t = normalizeArabic(q);
+  const prayer = /(تصلي|تصلين|تارك[هةا]? الصلاه|ترك الصلاه|لا يصلي|لايصلي|ماتصلي|ما تصلي|ماتصليش|بتصلي|مبتصل|مش بتصل|مابتصل)/.test(t);
+  const marriage = /(زواج|تزوج|اتجوز|نكاح|عقد|زوج[هةا]?\b|مراتي|جوزي|زوجتي|خطيبتي)/.test(t);
+  if (prayer && marriage) return true;
+  if (/(تكفير|اكفر|يكفر|حكم تارك الصلاه|حكم ترك الصلاه)/.test(t)) return true;
+  if (/(طلاق|تطليق|اطلق|يقع الطلاق|ايمان الطلاق)/.test(t)) return true;
+  if (/(بطلان|صحه) (عقد|نكاح|الزواج)|(شروط|اركان) (صحه )?(عقد|نكاح)/.test(t)) return true;
+  return false;
+}
+export function buildExcerptMode(sources: RagSource[], keywords: string[]): string {
+  const lab = (t: string) => t.replace(/\s+/g, ' ').replace(/(^|\s)س\s*:/g, '$1[سؤال السائل: سياق وليس حكماً] ').replace(/(^|\s)ج\s*:/g, '\n[جواب العالم] ');
+  const strong = new Set(strongRelevant(sources, keywords).map(x => x.book_id + ':' + x.page_id));
+  const pick = [...sources.filter(x => strong.has(x.book_id + ':' + x.page_id)), ...sources.filter(x => !strong.has(x.book_id + ':' + x.page_id))].slice(0, 4);
+  const parts = pick.map(x => {
+    const clean = lab(x.text.trim());
+    const cut = clean.length > 1500;
+    return `${x.citationMarkdown}\n«${cut ? clean.slice(0, 1500) + '…' : clean}»`;
+  });
+  return 'هذه مسألة خلافية، ولذلك أعرض لك نصوص المصادر نفسها كما وردت بدل أن أصوغ لك حكماً بكلامي. هذه مقتطفات من المصادر المسترجعة وليست إجابة مُركّبة؛ وهي نتيجة بحث آلي قد لا ينطبق بعضها على حالتك. انتبه لعبارات الخلاف والقيود الواردة فيها مثل «على الصحيح» و«وعند آخرين»، ولما بعد «سؤال السائل» فهو كلام السائل لا العالم، ولحالة السائل فقد تختلف عن حالتك. راجع عالماً ثقة في حالتك.\n\n'
+    + parts.join('\n\n');
 }
 
 /** Model-outage response: explicitly no generated answer; only verbatim retrieved
@@ -772,6 +798,13 @@ app.post('/api/chat', async (req, res) => {
         ? 'لم أجد هذه المسألة في المراجع المعتمدة المتاحة حالياً، ولن أجيب إلا عن نص موثق منها. جرّب صياغة أخرى، أو اسأل عن مسألة من مسائل العلم المدوّنة في الكتب المعتمدة.'
         : 'تعذر الوصول إلى مكتبة المصادر حالياً، يرجى المحاولة بعد لحظات.';
       res.write(`data: ${JSON.stringify({ text: msg })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+    if (rag.ok && !trivial && isContestedTopic(lastUserText + ' ' + (msaQuery || ''))) {
+      console.log('timing excerpt-mode (contested topic, no generation)');
+      res.write(`data: ${JSON.stringify({ text: buildExcerptMode(rag.sources, relKeywords) })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       return;
