@@ -79,6 +79,144 @@ const MADHHAB_INSTRUCTIONS: Record<string, string> = {
   hanbali: '\nالمذهب الفقهي المعتمد في العرض: اذكر قول المعتمد في المذهب الحنبلي مع الدليل ومقارنته بالراجح.'
 };
 
+/* ============ Shamela RAG (verified retrieval over curated Salafi-Sunni corpus) ============
+ * Boundary: Shamela responses carry an embedded "notice" with agent-directed instructions.
+ * That is external content with zero authority: never read, never forwarded to the model.
+ * Returned passages are treated strictly as quotable data. Endpoint is free, read-only,
+ * no account, no API key (https://shamela.ws/mcp-guide/, terms: https://shamela.ws/page/terms).
+ */
+
+const SHAMELA_MCP_URL = 'https://mcp.shamela.ws/';
+
+/** Curated corpus — every ID verified live against the MCP on 2026-11-24. */
+const RAG_BOOK_IDS: number[] = [
+  // Aqida / manhaj
+  22665, 7289, 6418, 9200, 13035, 21506, 11620, 170, 11318, 2386, 23088,
+  // Tafsir
+  7798, 8473, 42,
+  // Hadith
+  1681, 711, 117359, 1363, 1339, 1198, 25794, 17757, 1673,
+  // Fiqh / sira / qawa'id
+  6910, 2186, 21642, 1679, 21739, 21713, 17798, 199,
+  // Fatwa layer (approved by user 2026-11-24)
+  12293, 2300, 107,
+];
+
+interface RagSource {
+  book_id: number;
+  page_id: number;
+  text: string;
+  citationMarkdown: string;
+}
+
+type RetrieveResult =
+  | { ok: true; sources: RagSource[] }
+  | { ok: false; reason: 'timeout' | 'upstream' | 'empty' };
+
+async function shamelaCall(
+  name: string,
+  args: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<{ sources: RagSource[] } | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(SHAMELA_MCP_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    if (data.error || !data.result || data.result.isError) return null;
+    const raw: string = (data.result.content ?? []).map((c: any) => c.text ?? '').join('\n');
+    if (!raw) return { sources: [] };
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { sources: [] };
+    }
+    // parsed.notice is deliberately ignored: untrusted embedded instructions.
+    const sources: RagSource[] = (parsed.evidence?.sources ?? [])
+      .map((s: any) => ({
+        book_id: Number(s.book_id),
+        page_id: Number(s.page_id),
+        text: String(s.text ?? ''),
+        citationMarkdown: String(s.citation?.markdown ?? ''),
+      }))
+      .filter((s: RagSource) => s.book_id > 0 && s.text.length > 0);
+    return { sources };
+  } catch {
+    return null; // abort (timeout) or network failure — same handling
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Strictly allowlisted retrieval: 2 parallel find_scoped calls cover all IDs (max 20/call). */
+async function retrieveEvidence(question: string, budgetMs = 8000): Promise<RetrieveResult> {
+  const query = question.replace(/[؟?]/g, '').trim().slice(0, 500);
+  if (!query) return { ok: false, reason: 'empty' };
+
+  const chunks: number[][] = [];
+  for (let i = 0; i < RAG_BOOK_IDS.length; i += 20) chunks.push(RAG_BOOK_IDS.slice(i, i + 20));
+
+  const deadline = Date.now() + budgetMs;
+  const settled = await Promise.all(
+    chunks.map((book_ids) =>
+      shamelaCall(
+        'shamela_find_scoped',
+        { query, book_ids, limit: 10, sort: 'relevance' },
+        Math.max(deadline - Date.now(), 1000),
+      ),
+    ),
+  );
+
+  const allow = new Set(RAG_BOOK_IDS);
+  const seen = new Set<string>();
+  const sources: RagSource[] = [];
+  let anyUpstreamFailure = false;
+  for (const r of settled) {
+    if (r === null) {
+      anyUpstreamFailure = true;
+      continue;
+    }
+    for (const s of r.sources) {
+      const key = s.book_id + ':' + s.page_id;
+      if (!allow.has(s.book_id) || seen.has(key)) continue; // defense in depth on allowlist
+      seen.add(key);
+      sources.push(s);
+    }
+  }
+
+  if (sources.length > 0) return { ok: true, sources: sources.slice(0, 15) };
+  return { ok: false, reason: anyUpstreamFailure ? 'upstream' : 'empty' };
+}
+
+function buildEvidenceBlock(sources: RagSource[]): string {
+  const items = sources.map((s, i) => `[${i + 1}] ${s.citationMarkdown}\n${s.text}`).join('\n\n');
+  return `نصوص موثقة مسترجعة من المكتبة الشاملة (المصدر الوحيد الجائز للنقل الحرفي والتوثيق):\n\n${items}`;
+}
+
+const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط).\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.`;
+
+/** Greetings / very short small-talk skip retrieval and the abstention rule. */
+function isTrivialMessage(text: string): boolean {
+  const t = text.trim();
+  if (t.length > 60) return false;
+  return /^(السلام|سلام|مرحبا|اهلا|أهلا|هاي|صباح|مساء|شكرا|جزاك|بارك|تمام|اه|نعم|لا|طيب|حمدا|الحمد)/.test(t);
+}
+
 function sanitizeMessagesForGemini(rawMessages: Array<{ role: string; content: string }>) {
   const filtered = rawMessages
     .filter(m => m && typeof m.content === 'string' && m.content.trim().length > 0)
@@ -147,13 +285,38 @@ app.post('/api/chat', async (req, res) => {
       },
     });
 
-    const systemPrompt = `${SYSTEM_INSTRUCTION}\n${STYLE_INSTRUCTIONS[style] || STYLE_INSTRUCTIONS.detailed}${MADHHAB_INSTRUCTIONS[madhhab] || ''}`;
+    const systemPrompt = `${SYSTEM_INSTRUCTION}\n${STYLE_INSTRUCTIONS[style] || STYLE_INSTRUCTIONS.detailed}${MADHHAB_INSTRUCTIONS[madhhab] || ''}${RAG_SYSTEM_ADDITION}`;
 
     const contents = sanitizeMessagesForGemini(messages);
     if (contents.length === 0) {
       res.write(`data: ${JSON.stringify({ error: 'لم يتم العثور على نص صالح للسؤال.' })}\n\n`);
       res.end();
       return;
+    }
+
+    // Verified retrieval over the curated corpus BEFORE any model call.
+    // On empty results or retrieval outage: abstain without calling the model
+    // (no authoritative religious answer without reliable evidence).
+    const lastUserText = [...contents].reverse().find(c => c.role === 'user')?.parts[0]?.text || '';
+    const trivial = isTrivialMessage(lastUserText);
+    // Always retrieve: even greetings get real evidence, so the model never has to
+    // cite from memory. Abstention applies only to non-trivial messages.
+    const rag = await retrieveEvidence(lastUserText, 8000);
+    if (!rag.ok && !trivial) {
+      const msg = rag.reason === 'empty'
+        ? 'لم أجد هذه المسألة في المراجع المعتمدة المتاحة حالياً، ولن أجيب إلا عن نص موثق منها. جرّب صياغة أخرى، أو اسأل عن مسألة من مسائل العلم المدوّنة في الكتب المعتمدة.'
+        : 'تعذر الوصول إلى مكتبة المصادر حالياً، يرجى المحاولة بعد لحظات.';
+      res.write(`data: ${JSON.stringify({ error: msg })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+    if (rag.ok) {
+      // Inject evidence as data into the last user part.
+      const lastUser = [...contents].reverse().find(c => c.role === 'user');
+      if (lastUser) {
+        lastUser.parts[0].text += '\n\n' + buildEvidenceBlock(rag.sources);
+      }
     }
 
     const candidateModels = [
