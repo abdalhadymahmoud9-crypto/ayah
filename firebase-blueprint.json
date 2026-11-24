@@ -1,0 +1,128 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Represents the user's account, subscription plan, and usage metrics.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The unique Firebase Auth UID."
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name."
+        },
+        "plan": {
+          "type": "string",
+          "enum": ["free", "pro"],
+          "description": "User subscription plan tier."
+        },
+        "questionsCount": {
+          "type": "number",
+          "description": "Total questions asked or used in the current period."
+        },
+        "lastActiveDate": {
+          "type": "string",
+          "description": "Last active day format YYYY-MM-DD for quota tracking."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["userId", "plan", "questionsCount", "lastActiveDate"]
+    },
+    "UserChat": {
+      "title": "UserChat",
+      "description": "A conversation session belonging to a user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The chat ID."
+        },
+        "userId": {
+          "type": "string",
+          "description": "The owner user ID."
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "The title of the conversation."
+        },
+        "msgs": {
+          "type": "array",
+          "description": "The messages array in this conversation."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["id", "userId", "title", "msgs"]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "User preferences for theme, size, style, and madhhab.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The owner user ID."
+        },
+        "theme": {
+          "type": "string",
+          "enum": ["system", "light", "dark"],
+          "description": "UI Theme preference."
+        },
+        "size": {
+          "type": "string",
+          "enum": ["s", "m", "l"],
+          "description": "Font size preference."
+        },
+        "style": {
+          "type": "string",
+          "enum": ["short", "detailed"],
+          "description": "Scholarly response style."
+        },
+        "madhhab": {
+          "type": "string",
+          "enum": ["none", "hanafi", "maliki", "shafii", "hanbali"],
+          "description": "Jurisprudence school preference."
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["userId", "theme", "size", "style", "madhhab"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile with plan and question usage limit"
+    },
+    "/users/{userId}/chats/{chatId}": {
+      "schema": "UserChat",
+      "description": "User synced chats"
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": "UserSettings",
+      "description": "User synced preferences"
+    }
+  }
+}

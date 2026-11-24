@@ -1,0 +1,6 @@
+{
+  "name": "AYAH (آية)",
+  "description": "مساعد علمي وبحثي شرعي وفق عقيدة وفقه أهل السنة والجماعة بفهم السلف الصالح",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
