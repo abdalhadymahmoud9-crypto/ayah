@@ -203,6 +203,105 @@ async function retrieveEvidence(question: string, budgetMs = 8000): Promise<Retr
   return { ok: false, reason: anyUpstreamFailure ? 'upstream' : 'empty' };
 }
 
+
+/* ---- Question understanding: dialect-safe retrieval + relevance ---- */
+
+// Deterministic Egyptian-dialect -> standard fiqh Arabic expansion (works even when the model is down).
+const DIALECT_MAP: Record<string, string> = {
+  'اتجوز': 'زواج نكاح تزوج', 'اتجوزها': 'زواج نكاح تزوج', 'اتجوزه': 'زواج نكاح تزوج', 'نتجوز': 'زواج نكاح تزوج',
+  'جواز': 'زواج نكاح', 'جوازي': 'زواج نكاح', 'الجواز': 'زواج نكاح', 'جوازه': 'زواج نكاح',
+  'مراتي': 'زوجتي الزوجه', 'مراته': 'زوجته الزوجه', 'جوزي': 'زوجي الزوج', 'خطيبتي': 'خطبه مخطوبه',
+  'خطوبه': 'خطبه', 'الخطوبه': 'خطبه', 'اطلق': 'طلاق', 'هطلق': 'طلاق', 'طلقتها': 'طلاق', 'طلقت': 'طلاق',
+  'فلوس': 'مال', 'فايده': 'ربا فائده', 'الفايده': 'ربا فائده', 'بنك': 'ربا بنوك', 'البنك': 'ربا بنوك',
+  'سجاير': 'تدخين', 'سيجاره': 'تدخين', 'شيشه': 'تدخين', 'اغاني': 'غناء معازف', 'الاغاني': 'غناء معازف',
+  'موسيقي': 'معازف غناء', 'الموسيقي': 'معازف غناء', 'تصوير': 'تصوير صور', 'حجاب': 'حجاب خمار',
+  'ينفع': 'يجوز', 'ازاي': 'كيف', 'اقرا': 'قراءه', 'ادعي': 'دعاء',
+};
+const DIALECT_STOP = new Set(['عاوز', 'عايز', 'عاوزه', 'عايزه', 'ينفع', 'ازاي', 'يعني', 'وكان', 'سؤال', 'لو', 'انا', 'ده', 'دي']);
+const KEYWORD_SKIP = new Set(['كيف', 'يجوز']);
+
+export function dialectExpand(text: string): { msaQuery: string; keywords: string[]; hit: boolean } {
+  const toks = normalizeArabic(text).split(' ').filter(Boolean);
+  const out: string[] = [];
+  const keys: string[] = [];
+  let hit = false;
+  for (const t of toks) {
+    const m = DIALECT_MAP[t];
+    if (m) {
+      hit = true;
+      for (const w of m.split(' ')) { if (!out.includes(w)) out.push(w); if (!KEYWORD_SKIP.has(w) && !keys.includes(w)) keys.push(w); }
+    } else if (!DIALECT_STOP.has(t)) {
+      out.push(t);
+    }
+  }
+  return { msaQuery: out.join(' ').trim(), keywords: keys, hit };
+}
+
+let understandBlockedUntil = 0; // skip the rewrite call briefly after it failed (avoids stacking latency in a provider wave)
+
+export interface Understanding { inScope: boolean; msa: string; keywords: string[]; }
+
+async function understandQuestion(ai: GoogleGenAI, text: string, prior: string, budgetMs = 6000): Promise<Understanding | null> {
+  const prompt = `أنت مصنّف ومحرّر استعلامات لمساعد شرعي. المستخدم يكتب غالباً بالعامية المصرية.
+السؤال الحالي: «${text.slice(0, 600)}»
+${prior ? `سياق سابق من المستخدم: «${prior.slice(0, 400)}»` : ''}
+أعد JSON فقط بهذا الشكل:
+{"in_scope": true|false, "msa": "<السؤال بالعربية الفصحى الفقهية الواضحة مع حل الإحالات من السياق>", "keywords": ["<٢ إلى ٦ كلمات مفتاحية فصيحة كما ترد في كتب الفقه والحديث، بجذورها وصيغها الشائعة، مثل: زواج، نكاح، تزوج>"]}
+in_scope تكون true لأي سؤال عن الدين الإسلامي أو الفقه أو العقيدة أو الحديث أو التفسير أو السيرة أو الأخلاق الشرعية أو معاملات الحياة من منظور شرعي (وإن كُتب بالعامية)، وfalse لغير ذلك (برمجة، رياضة، جغرافيا، ترفيه...). لا تفسّر بأكثر من JSON.`;
+  const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash'];
+  const deadline = Date.now() + budgetMs;
+  for (const model of models) {
+    const remaining = deadline - Date.now();
+    if (remaining < 800) break;
+    try {
+      const r: any = await Promise.race([
+        ai.models.generateContent({ model, contents: [{ role: 'user', parts: [{ text: prompt }] }], config: { responseMimeType: 'application/json' } }),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('understand timeout')), Math.min(4000, remaining))),
+      ]);
+      const raw = String(r?.text ?? '').trim();
+      const j = JSON.parse(raw.replace(/^```(?:json)?|```$/g, '').trim());
+      const kws: string[] = Array.isArray(j.keywords) ? j.keywords.map((k: any) => String(k)).filter((k: string) => k.length >= 2).slice(0, 8) : [];
+      const msa = typeof j.msa === 'string' ? j.msa.trim().slice(0, 400) : '';
+      if (typeof j.in_scope !== 'boolean') continue;
+      return { inScope: j.in_scope, msa, keywords: kws };
+    } catch {
+      /* try next model / give up quietly */
+    }
+  }
+  return null;
+}
+
+/** Keep passages sharing at least one key term (normalized, definite article stripped). */
+export function filterRelevant(sources: RagSource[], keywords: string[]): RagSource[] {
+  const stems = keywords
+    .map(k => normalizeArabic(k).replace(/^ال/, ''))
+    .filter(k => k.length >= 3);
+  if (stems.length === 0) return sources;
+  return sources.filter(s => {
+    const h = normalizeArabic(s.text);
+    return stems.some(k => h.includes(k));
+  });
+}
+
+async function retrieveMulti(queries: string[], budgetMs = 8000): Promise<RetrieveResult> {
+  const uniq = [...new Set(queries.map(q => q.trim()).filter(Boolean))];
+  const results = await Promise.all(uniq.map(q => retrieveEvidence(q, budgetMs)));
+  const seen = new Set<string>();
+  const merged: RagSource[] = [];
+  let anyUpstream = false;
+  for (const r of results) {
+    if (!r.ok) { if (r.reason !== 'empty') anyUpstream = true; continue; }
+    for (const src of r.sources) {
+      const key = src.book_id + ':' + src.page_id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(src);
+    }
+  }
+  if (merged.length > 0) return { ok: true, sources: merged.slice(0, 20) };
+  return { ok: false, reason: anyUpstream ? 'upstream' : 'empty' };
+}
+
 function buildEvidenceBlock(sources: RagSource[]): string {
   const items = sources.map((s, i) => `[${i + 1}] ${s.citationMarkdown}\n${s.text}`).join('\n\n');
   return `نصوص موثقة مسترجعة من المكتبة الشاملة (المصدر الوحيد الجائز للنقل الحرفي والتوثيق):\n\n${items}`;
@@ -289,6 +388,7 @@ const RELIGIOUS_TERMS = [
   'الله', 'النبي', 'رسول', 'ركعه', 'سجده', 'سجود', 'ركوع', 'وتر', 'تراويح', 'قيام',
   'تشهد', 'اذان', 'اقامه', 'خطبه', 'الجمعه', 'العيد', 'الفجر', 'الظهر', 'العصر',
   'المغرب', 'العشاء', 'استخاره', 'استغفار', 'تهجد', 'اعتكاف', 'نصاب', 'دليل', 'توحيد',
+  'مطر', 'جورب', 'مسح', 'جمع بين', 'تفسير', 'تعالي', 'سبحانه', 'عباده', 'تزوج', 'اتجوز', 'جواز', 'خطبه', 'خطوبه', 'مولد', 'بيع', 'عينه', 'معامله', 'افطار', 'مسافر', 'تدخين', 'غناء', 'معازف',
   'نبوه', 'رساله', 'صحابه', 'التابعين', 'عذاب', 'جنه', 'نار', 'آخرة', 'اخره', 'ميعاد',
 ];
 
@@ -308,15 +408,15 @@ export function buildExtractiveFallback(sources: RagSource[]): string {
     const cut = clean.length > 500;
     return `${s.citationMarkdown}\n«${cut ? clean.slice(0, 500) : clean}${cut ? '…' : ''}»`;
   });
-  return 'لا أملك إجابة موثقة على هذا السؤال من المصادر المعتمدة. الفقرات التالية هي أقرب ما استُرجع منها حرفياً، وقد لا تنص على جواب مسألتك؛ تُعرض للاستئناس فقط ولا تُعد إجابة:\n\n'
+  return 'لا أملك إجابة موثقة على هذا السؤال من المصادر المعتمدة. الفقرات التالية نتيجة بحث نصي آلي، وقد لا تتعلق بسؤالك؛ تُعرض للاستئناس فقط ولا تُعد إجابة:\n\n'
     + parts.join('\n\n')
-    + '\n\nإن لم تنص هذه الفقرات على جواب مسألتك، فالمراجع المتاحة لم تنص عليه.';
+    + '\n\nهذه نتائج بحث بالكلمات وليست حكماً على المصادر: عدم ظهور جواب فيها لا يعني أن المصادر المعتمدة تخلو منه.';
 }
 
 /** Model-outage response: explicitly no generated answer; only verbatim retrieved
  * passages with their exact citations. */
 export function buildOutageFallback(sources: RagSource[]): string {
-  return 'خوادم التوليد مضغوطة حالياً، فلا أقدّم إجابة مولّدة. هذه أقرب الفقرات المسترجعة حرفياً من المصادر المعتمدة بتوثيقها الدقيق، وقد لا تنص على جواب مسألتك:\n\n'
+  return 'خوادم التوليد مضغوطة حالياً، فلا أقدّم إجابة مولّدة. هذه فقرات مسترجعة حرفياً من المصادر المعتمدة بتوثيقها الدقيق عبر بحث نصي آلي، وقد لا تتعلق بسؤالك:\n\n'
     + buildExtractiveFallback(sources).split('\n\n').slice(1).join('\n\n');
 }
 
@@ -460,6 +560,8 @@ app.post('/api/chat', async (req, res) => {
 
   let rag: Awaited<ReturnType<typeof retrieveEvidence>> = { ok: false, reason: 'upstream' };
   let trivial = false;
+  let relevantCount = -1; // -1: relevance not assessed
+  let relevantKeys: Set<string> | null = null;
   try {
     const ai = new GoogleGenAI({
       apiKey,
@@ -487,16 +589,45 @@ app.post('/api/chat', async (req, res) => {
     // Deterministic scope gate: non-religious questions are declined outright
     // rather than answered from tangentially retrieved texts.
     const priorUserText = [...contents].reverse().filter(c => c.role === 'user').slice(1, 3).map(c => c.parts[0]?.text || '').join(' ');
-    if (!trivial && isOutOfScopeQuestion(lastUserText, priorUserText)) {
+    const tStart = Date.now();
+    const kwInScope = !isOutOfScopeQuestion(lastUserText, priorUserText);
+    let und: Understanding | null = null;
+    if (!trivial && Date.now() >= understandBlockedUntil) {
+      und = await understandQuestion(ai, lastUserText, priorUserText, 6000);
+      if (!und) understandBlockedUntil = Date.now() + 45000;
+    }
+    const tUnderstand = Date.now() - tStart;
+    // Scope: the model's classification when available; keyword gate only when it is not.
+    const outOfScope = und ? !und.inScope : !kwInScope;
+    if (!trivial && outOfScope) {
       const msg = 'هذا المساعد مخصص للمسائل الشرعية والعلوم الإسلامية فقط، وسؤالك خارج هذا النطاق. اسأل عن مسألة شرعية أو عقدية أو من علوم الدين.';
       res.write(`data: ${JSON.stringify({ text: msg })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
+      console.log(`timing refuse-scope understand=${tUnderstand}ms via=${und ? 'model' : 'keywords'}`);
       return;
     }
-    // Always retrieve: even greetings get real evidence, so the model never has to
-    // cite from memory. Abstention applies only to non-trivial messages.
-    rag = await retrieveEvidence(lastUserText, 8000);
+    // Dialect-safe queries: original + standard-Arabic rewrite (model, else dictionary).
+    const dia = dialectExpand(lastUserText);
+    const msaQuery = (und && und.msa) ? und.msa : (dia.hit ? dia.msaQuery : '');
+    const GENERIC_STOP = new Set(['ما', 'حكم', 'هل', 'من', 'في', 'علي', 'عن', 'الي', 'هذا', 'هذه', 'ان', 'او', 'كيف', 'يجوز', 'لماذا', 'متي', 'اذا', 'كان', 'يكون', 'الذي', 'التي', 'مع', 'بين', 'ثم', 'قال', 'كل', 'لا', 'لم', 'له', 'لي', 'به']);
+    const queryTokens = normalizeArabic(lastUserText).split(' ').filter(t => t.length >= 3 && !GENERIC_STOP.has(t) && !DIALECT_STOP.has(t) && !DIALECT_MAP[t]);
+    // keywords: model's standard-Arabic terms; else dictionary terms; else the question's own content words
+    const relKeywords = (und && und.keywords.length) ? und.keywords : (dia.keywords.length ? dia.keywords : queryTokens.slice(0, 5));
+    const queries = msaQuery ? [msaQuery, lastUserText] : [lastUserText];
+    const tRet0 = Date.now();
+    rag = await retrieveMulti(queries, 8000);
+    const tRetrieve = Date.now() - tRet0;
+    console.log(`timing understand=${tUnderstand}ms(${und ? 'model' : 'none'}) retrieve=${tRetrieve}ms queries=${queries.length} dialectHit=${dia.hit}`);
+    if (rag.ok && relKeywords.length > 0 && !trivial) {
+      // Relevance heuristic (term overlap, NOT semantic proof): reorder so matching passages come first.
+      // Nothing is dropped here; the outage display (below) is the only place non-matching passages are hidden.
+      const rel = filterRelevant(rag.sources, relKeywords);
+      const relSet = new Set(rel);
+      rag = { ok: true, sources: [...rel, ...rag.sources.filter(x => !relSet.has(x))].slice(0, 15) };
+      relevantCount = rel.length;
+      relevantKeys = new Set(rel.map(x => x.book_id + ':' + x.page_id));
+    }
     if (!rag.ok && !trivial) {
       const msg = rag.reason === 'empty'
         ? 'لم أجد هذه المسألة في المراجع المعتمدة المتاحة حالياً، ولن أجيب إلا عن نص موثق منها. جرّب صياغة أخرى، أو اسأل عن مسألة من مسائل العلم المدوّنة في الكتب المعتمدة.'
@@ -672,7 +803,8 @@ app.post('/api/chat', async (req, res) => {
       }
       finalText = v.text;
       if (!trivial && v.verifiedUnits === 0 && ragSources.length > 0) {
-        finalText = buildExtractiveFallback(ragSources);
+        const shownX = relevantKeys ? ragSources.filter(x => relevantKeys!.has(x.book_id + ':' + x.page_id)) : ragSources;
+        finalText = shownX.length > 0 ? buildExtractiveFallback(shownX) : 'لا أملك إجابة موثقة على هذا السؤال، والبحث النصي لم يُرجع فقرات تشترك مع كلمات سؤالك المفتاحية. هذا لا يعني أن المصادر المعتمدة تخلو من الجواب؛ جرّب صياغة أخرى للسؤال.';
         console.log('citation validation: answer replaced with extractive fallback (no verifiable citation units)');
       }
     }
@@ -705,8 +837,12 @@ app.post('/api/chat', async (req, res) => {
       // Graceful degradation: on model outage with retrieved evidence, return the
       // verbatim retrieved passages with exact citations and no generated answer.
       if (!trivial && rag.ok && rag.sources.length > 0) {
-        console.log('model outage: serving retrieval-only fallback (no generated answer)');
-        res.write(`data: ${JSON.stringify({ text: buildOutageFallback(rag.sources) })}\n\n`);
+        console.log(`model outage: serving retrieval-only fallback (no generated answer) relevant=${relevantCount}`);
+        const shown = relevantKeys ? rag.sources.filter(x => relevantKeys!.has(x.book_id + ':' + x.page_id)) : rag.sources;
+        const outText = shown.length > 0
+          ? buildOutageFallback(shown)
+          : 'خوادم التوليد مضغوطة حالياً، فلا أقدّم إجابة مولّدة. والبحث النصي لم يُرجع فقرات تشترك مع كلمات سؤالك المفتاحية. هذا لا يعني أن المصادر المعتمدة تخلو من الجواب؛ أعد المحاولة بعد قليل أو جرّب صياغة أخرى.';
+        res.write(`data: ${JSON.stringify({ text: outText })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
         return;
