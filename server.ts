@@ -208,7 +208,7 @@ function buildEvidenceBlock(sources: RagSource[]): string {
   return `نصوص موثقة مسترجعة من المكتبة الشاملة (المصدر الوحيد الجائز للنقل الحرفي والتوثيق):\n\n${items}`;
 }
 
-const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط).\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.`;
+const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط)، وأرفق رابط الشاملة الكامل نفسه في خانة الموضع لكل مرجع؛ فالمرجع بلا رابط يُحذف آلياً.\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.`;
 
 /* ---- Server-side citation validation: no citation is presented as verified
  * unless it is backed by text actually retrieved in THIS request. ---- */
@@ -225,32 +225,25 @@ export function normalizeArabic(s: string): string {
     .trim();
 }
 
-interface RetrievedBook {
-  id: number;
+interface RetrievedSource {
+  bookId: number;
+  pageId: number;
   titleVariants: string[]; // normalized
-  haystack: string;        // normalized concatenated retrieved text
+  haystack: string;        // normalized retrieved text of this exact passage
 }
 
-function buildRetrievedBooks(sources: RagSource[]): RetrievedBook[] {
-  const map = new Map<number, RetrievedBook>();
-  for (const s of sources) {
+function buildRetrievedSources(sources: RagSource[]): RetrievedSource[] {
+  return sources.map(s => {
     const m = s.citationMarkdown.match(/\[([^\]]+)\]/);
     const rawTitle = m ? m[1].replace(/\s*\([^)]*\)\s*$/, '') : '';
     const variants = rawTitle.split('=')
       .map(v => normalizeArabic(v))
       .filter(v => v.length > 2);
-    let b = map.get(s.book_id);
-    if (!b) {
-      b = { id: s.book_id, titleVariants: [], haystack: '' };
-      map.set(s.book_id, b);
-    }
-    for (const v of variants) if (!b.titleVariants.includes(v)) b.titleVariants.push(v);
-    b.haystack += ' ' + normalizeArabic(s.text);
-  }
-  return [...map.values()];
+    return { bookId: s.book_id, pageId: s.page_id, titleVariants: variants, haystack: normalizeArabic(s.text) };
+  });
 }
 
-function titleMatchesBook(cardTitle: string, book: RetrievedBook): boolean {
+function titleMatchesBook(cardTitle: string, book: { titleVariants: string[] }): boolean {
   const t = normalizeArabic(cardTitle);
   if (!t) return false;
   for (const v of book.titleVariants) {
@@ -282,17 +275,53 @@ export interface ValidationResult {
   hadCitations: boolean;
   verifiedUnits: number;
   droppedCards: number;
-  dequotedSpans: number;
+  removedSpans: number;
   droppedLinks: number;
 }
 
+const RELIGIOUS_TERMS = [
+  'حكم', 'شرع', 'دين', 'اسلام', 'صلاه', 'زكاه', 'زكوة', 'صدقه', 'صوم', 'صيام', 'رمضان',
+  'حج', 'عمره', 'عقيده', 'توحيد', 'شرك', 'بدعه', 'قران', 'ايه', 'حديث', 'سنه', 'فقه',
+  'طهاره', 'وضوء', 'غسل', 'جنابه', 'تيمم', 'نكاح', 'زواج', 'طلاق', 'ميراث', 'ارث', 'ربا',
+  'كفاره', 'يمين', 'نذر', 'ذبح', 'اضحيه', 'عقيقه', 'جهاد', 'اذكار', 'دعاء', 'توبه',
+  'شهاده', 'مسجد', 'امام', 'جماعه', 'جنازه', 'قبر', 'رقيه', 'سحر', 'حلال', 'حرام',
+  'مباح', 'واجب', 'فرض', 'مستحب', 'مكروه', 'سنن', 'سلف', 'مذهب', 'فتوي', 'فتوى',
+  'الله', 'النبي', 'رسول', 'ركعه', 'سجده', 'سجود', 'ركوع', 'وتر', 'تراويح', 'قيام',
+  'تشهد', 'اذان', 'اقامه', 'خطبه', 'الجمعه', 'العيد', 'الفجر', 'الظهر', 'العصر',
+  'المغرب', 'العشاء', 'استخاره', 'استغفار', 'تهجد', 'اعتكاف', 'نصاب', 'دليل', 'توحيد',
+  'نبوه', 'رساله', 'صحابه', 'التابعين', 'عذاب', 'جنه', 'نار', 'آخرة', 'اخره', 'ميعاد',
+];
+
+/** Deterministic scope gate: only religious/Islamic questions are in scope. */
+export function isOutOfScopeQuestion(text: string, priorUserText: string): boolean {
+  const t = normalizeArabic(text + ' ' + priorUserText);
+  if (!t) return false;
+  for (const term of RELIGIOUS_TERMS) if (t.includes(term)) return false;
+  return true;
+}
+
+/** Source-backed extractive fallback: only verbatim retrieved passages with their
+ * real citations. Used when no model citation can be verified. */
+export function buildExtractiveFallback(sources: RagSource[]): string {
+  const parts = sources.slice(0, 3).map(s => {
+    const clean = s.text.replace(/\s+/g, ' ').trim();
+    const cut = clean.length > 500;
+    return `${s.citationMarkdown}\n«${cut ? clean.slice(0, 500) : clean}${cut ? '…' : ''}»`;
+  });
+  return 'لم أتمكن من تقديم إجابة موثقة الصياغة لهذه المسألة، فإليك النصوص المسترجعة من المصادر المعتمدة كما وردت حرفياً:\n\n'
+    + parts.join('\n\n')
+    + '\n\nإن لم تنص هذه الفقرات على جواب مسألتك، فالمراجع المتاحة لم تنص عليه.';
+}
+
 export function validateAnswerCitations(answer: string, sources: RagSource[]): ValidationResult {
-  const books = buildRetrievedBooks(sources);
-  const allHaystack = books.map(b => b.haystack).join(' ');
-  let droppedCards = 0, dequotedSpans = 0, droppedLinks = 0, verifiedUnits = 0;
+  const rsrc = buildRetrievedSources(sources);
+  const allHaystack = rsrc.map(s => s.haystack).join(' ');
+  let droppedCards = 0, removedSpans = 0, droppedLinks = 0, verifiedUnits = 0;
   let hadCitations = false;
 
-  // 1) Validate the [[مراجع]] cards.
+  // 1) [[مراجع]] cards: title must match a retrieved source, the excerpt must be
+  // verbatim in THAT source, and the card's shamela link must point at exactly
+  // that source's book+page. No link, wrong page, or unverified quote: drop.
   const refMatch = answer.match(/\[\[مراجع\]\]([\s\S]*?)(?=\[\[متابعة\]\]|$)/);
   if (refMatch) {
     const lines = refMatch[1].split('\n').map(l => l.trim()).filter(l => l.length > 0);
@@ -313,45 +342,48 @@ export function validateAnswerCitations(answer: string, sources: RagSource[]): V
         if (ci > 0) { title = cleanLine.slice(0, ci).trim(); excerpt = cleanLine.slice(ci + 1).trim(); }
         else { title = cleanLine; }
       }
-      const book = books.find(b => titleMatchesBook(title, b));
-      const ok = !!book && !!excerpt && quoteInHaystack(excerpt, book.haystack);
-      if (ok) { kept.push(line); verifiedUnits++; }
+      const linkM = line.match(/shamela\.ws\/book\/(\d+)\/(\d+)/);
+      const candidates = rsrc.filter(s => titleMatchesBook(title, s) && !!excerpt && quoteInHaystack(excerpt, s.haystack));
+      const exact = linkM ? candidates.find(s => s.bookId === Number(linkM[1]) && s.pageId === Number(linkM[2])) : undefined;
+      if (exact) { kept.push(line); verifiedUnits++; }
       else { droppedCards++; hadCitations = true; }
     }
     if (kept.length > 0) {
       answer = answer.replace(refMatch[0], '[[مراجع]]\n' + kept.join('\n') + '\n');
       hadCitations = true;
     } else {
-      // No verified cards: remove the whole references block so nothing is labeled verified.
       answer = answer.replace(/\[\[مراجع\]\][\s\S]*?(?=\[\[متابعة\]\]|$)/, '').trim();
     }
   }
 
-  // 2) Validate inline shamela.ws links against retrieved book IDs.
-  answer = answer.replace(/\[([^\]]*)\]\(https:\/\/shamela\.ws\/book\/(\d+)[^)]*\)/g,
-    (whole, label, idStr) => {
+  // 2) Inline shamela.ws links must point at an exact retrieved book+page.
+  answer = answer.replace(/\[([^\]]*)\]\(https:\/\/shamela\.ws\/book\/(\d+)(?:\/(\d+))?[^)]*\)/g,
+    (whole, label, b, p) => {
       hadCitations = true;
-      if (books.some(b => b.id === Number(idStr))) { verifiedUnits++; return whole; }
+      if (p && rsrc.some(s => s.bookId === Number(b) && s.pageId === Number(p))) { verifiedUnits++; return whole; }
       droppedLinks++;
       return label;
     });
 
-  // 3) Validate inline «...» quotes outside the references block: keep marks only
-  //    when the words appear verbatim in retrieved text; otherwise de-quote
-  //    (the text stays as the model's own words, never as a quotation).
+  // 3) Attributed quotations outside the references block («...» and ﴿...﴾) of
+  // load-bearing length must be verbatim in retrieved text; otherwise the span is
+  // REMOVED (fail closed: an unverified quotation is never shown as paraphrase).
+  const UNVERIFIED = '(حُذف مقطع لم يتحقق من مصدره)';
   const refsBlock = answer.match(/\[\[مراجع\]\][\s\S]*?(?=\[\[متابعة\]\]|$)/)?.[0] || '';
   const marked = refsBlock ? answer.replace(refsBlock, '\u0000REFS\u0000') : answer;
-  const validatedBody = marked.replace(/«([^»]+)»/g, (whole, q) => {
+  const check = (whole: string, q: string) => {
     const nq = normalizeArabic(q);
-    if (nq.length < 15) return whole; // short quoted phrases are not load-bearing citations
+    if (nq.length < 15) return whole;
     hadCitations = true;
     if (allHaystack && quoteInHaystack(q, allHaystack)) { verifiedUnits++; return whole; }
-    dequotedSpans++;
-    return q;
-  });
+    removedSpans++;
+    return UNVERIFIED;
+  };
+  let validatedBody = marked.replace(/«([^»]+)»/g, check);
+  validatedBody = validatedBody.replace(/﴿([^﴾]+)﴾/g, check);
   answer = refsBlock ? validatedBody.replace('\u0000REFS\u0000', refsBlock) : validatedBody;
 
-  return { text: answer, hadCitations, verifiedUnits, droppedCards, dequotedSpans, droppedLinks };
+  return { text: answer, hadCitations, verifiedUnits, droppedCards, removedSpans, droppedLinks };
 }
 
 /** Greetings / very short small-talk skip retrieval and the abstention rule. */
@@ -443,6 +475,16 @@ app.post('/api/chat', async (req, res) => {
     // (no authoritative religious answer without reliable evidence).
     const lastUserText = [...contents].reverse().find(c => c.role === 'user')?.parts[0]?.text || '';
     const trivial = isTrivialMessage(lastUserText);
+    // Deterministic scope gate: non-religious questions are declined outright
+    // rather than answered from tangentially retrieved texts.
+    const priorUserText = [...contents].reverse().filter(c => c.role === 'user').slice(1, 3).map(c => c.parts[0]?.text || '').join(' ');
+    if (!trivial && isOutOfScopeQuestion(lastUserText, priorUserText)) {
+      const msg = 'هذا المساعد مخصص للمسائل الشرعية والعلوم الإسلامية فقط، وسؤالك خارج هذا النطاق. اسأل عن مسألة شرعية أو عقدية أو من علوم الدين.';
+      res.write(`data: ${JSON.stringify({ error: msg })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
     // Always retrieve: even greetings get real evidence, so the model never has to
     // cite from memory. Abstention applies only to non-trivial messages.
     const rag = await retrieveEvidence(lastUserText, 8000);
@@ -607,23 +649,22 @@ app.post('/api/chat', async (req, res) => {
     }
 
     let finalText = fullText || fallbackText;
-    // Server-side citation validation: only citations backed by text retrieved in
-    // THIS request may be presented as verified. If the model claimed citations and
-    // none survived verification on a real question, abstain instead of answering
-    // unsupported.
+    // Server-side citation validation, fail closed: only citations backed by text
+    // retrieved in THIS request survive — exact book AND exact page. Unverified
+    // quotations are removed, never relabeled as paraphrase. If nothing verifiable
+    // remains on a non-trivial question, the user gets only the retrieved source
+    // passages verbatim (extractive fallback), never an unbacked answer.
     if (finalText) {
       const ragSources = rag.ok ? rag.sources : [];
       const v = validateAnswerCitations(finalText, ragSources);
-      if (v.droppedCards || v.dequotedSpans || v.droppedLinks) {
-        console.log(`citation validation: droppedCards=${v.droppedCards} dequoted=${v.dequotedSpans} droppedLinks=${v.droppedLinks} verified=${v.verifiedUnits}`);
-      }
-      if (v.hadCitations && v.verifiedUnits === 0 && !trivial) {
-        res.write(`data: ${JSON.stringify({ error: 'لم تتحقق المصادر لهذه الإجابة من النصوص المسترجعة، فلا أقدّمها إليك غير موثقة. جرّب إعادة السؤال بصياغة أخرى.' })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-        return;
+      if (v.droppedCards || v.removedSpans || v.droppedLinks) {
+        console.log(`citation validation: droppedCards=${v.droppedCards} removedSpans=${v.removedSpans} droppedLinks=${v.droppedLinks} verified=${v.verifiedUnits}`);
       }
       finalText = v.text;
+      if (!trivial && v.verifiedUnits === 0 && ragSources.length > 0) {
+        finalText = buildExtractiveFallback(ragSources);
+        console.log('citation validation: answer replaced with extractive fallback (no verifiable citation units)');
+      }
     }
     if (finalText) {
       // Chunk out the completed answer smoothly
