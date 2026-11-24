@@ -308,7 +308,7 @@ export function buildExtractiveFallback(sources: RagSource[]): string {
     const cut = clean.length > 500;
     return `${s.citationMarkdown}\n«${cut ? clean.slice(0, 500) : clean}${cut ? '…' : ''}»`;
   });
-  return 'لم أتمكن من تقديم إجابة موثقة الصياغة لهذه المسألة، فإليك النصوص المسترجعة من المصادر المعتمدة كما وردت حرفياً:\n\n'
+  return 'لا أملك إجابة موثقة على هذا السؤال من المصادر المعتمدة. الفقرات التالية هي أقرب ما استُرجع منها حرفياً، وقد لا تنص على جواب مسألتك؛ تُعرض للاستئناس فقط ولا تُعد إجابة:\n\n'
     + parts.join('\n\n')
     + '\n\nإن لم تنص هذه الفقرات على جواب مسألتك، فالمراجع المتاحة لم تنص عليه.';
 }
@@ -480,7 +480,7 @@ app.post('/api/chat', async (req, res) => {
     const priorUserText = [...contents].reverse().filter(c => c.role === 'user').slice(1, 3).map(c => c.parts[0]?.text || '').join(' ');
     if (!trivial && isOutOfScopeQuestion(lastUserText, priorUserText)) {
       const msg = 'هذا المساعد مخصص للمسائل الشرعية والعلوم الإسلامية فقط، وسؤالك خارج هذا النطاق. اسأل عن مسألة شرعية أو عقدية أو من علوم الدين.';
-      res.write(`data: ${JSON.stringify({ error: msg })}\n\n`);
+      res.write(`data: ${JSON.stringify({ text: msg })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       return;
@@ -492,7 +492,7 @@ app.post('/api/chat', async (req, res) => {
       const msg = rag.reason === 'empty'
         ? 'لم أجد هذه المسألة في المراجع المعتمدة المتاحة حالياً، ولن أجيب إلا عن نص موثق منها. جرّب صياغة أخرى، أو اسأل عن مسألة من مسائل العلم المدوّنة في الكتب المعتمدة.'
         : 'تعذر الوصول إلى مكتبة المصادر حالياً، يرجى المحاولة بعد لحظات.';
-      res.write(`data: ${JSON.stringify({ error: msg })}\n\n`);
+      res.write(`data: ${JSON.stringify({ text: msg })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       return;
