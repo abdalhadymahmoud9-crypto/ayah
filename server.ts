@@ -210,6 +210,150 @@ function buildEvidenceBlock(sources: RagSource[]): string {
 
 const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط).\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.`;
 
+/* ---- Server-side citation validation: no citation is presented as verified
+ * unless it is backed by text actually retrieved in THIS request. ---- */
+
+export function normalizeArabic(s: string): string {
+  return s
+    .replace(/[\u064B-\u0652\u0670\u0640\u06D6-\u06ED]/g, '')
+    .replace(/[\u0623\u0625\u0622\u0671]/g, '\u0627')
+    .replace(/\u0649/g, '\u064A')
+    .replace(/\u0629/g, '\u0647')
+    .replace(/[\u0624\u0626]/g, '\u0621')
+    .replace(/[^\u0600-\u06FFa-zA-Z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+interface RetrievedBook {
+  id: number;
+  titleVariants: string[]; // normalized
+  haystack: string;        // normalized concatenated retrieved text
+}
+
+function buildRetrievedBooks(sources: RagSource[]): RetrievedBook[] {
+  const map = new Map<number, RetrievedBook>();
+  for (const s of sources) {
+    const m = s.citationMarkdown.match(/\[([^\]]+)\]/);
+    const rawTitle = m ? m[1].replace(/\s*\([^)]*\)\s*$/, '') : '';
+    const variants = rawTitle.split('=')
+      .map(v => normalizeArabic(v))
+      .filter(v => v.length > 2);
+    let b = map.get(s.book_id);
+    if (!b) {
+      b = { id: s.book_id, titleVariants: [], haystack: '' };
+      map.set(s.book_id, b);
+    }
+    for (const v of variants) if (!b.titleVariants.includes(v)) b.titleVariants.push(v);
+    b.haystack += ' ' + normalizeArabic(s.text);
+  }
+  return [...map.values()];
+}
+
+function titleMatchesBook(cardTitle: string, book: RetrievedBook): boolean {
+  const t = normalizeArabic(cardTitle);
+  if (!t) return false;
+  for (const v of book.titleVariants) {
+    if (t.includes(v) || v.includes(t)) return true;
+    const tt = new Set(t.split(' ').filter(w => w.length > 2));
+    const vt = new Set(v.split(' ').filter(w => w.length > 2));
+    let inter = 0;
+    for (const w of tt) if (vt.has(w)) inter++;
+    if (tt.size > 0 && inter / tt.size >= 0.6) return true;
+  }
+  return false;
+}
+
+/** All non-trivial fragments of the quote must appear in the haystack. */
+function quoteInHaystack(quote: string, haystack: string): boolean {
+  const fragments = quote
+    .split(/[\u2026.]{3}|\u2026/)
+    .map(f => normalizeArabic(f))
+    .filter(f => f.length >= 10);
+  if (fragments.length === 0) {
+    const q = normalizeArabic(quote);
+    return q.length >= 10 && haystack.includes(q);
+  }
+  return fragments.every(f => haystack.includes(f));
+}
+
+export interface ValidationResult {
+  text: string;
+  hadCitations: boolean;
+  verifiedUnits: number;
+  droppedCards: number;
+  dequotedSpans: number;
+  droppedLinks: number;
+}
+
+export function validateAnswerCitations(answer: string, sources: RagSource[]): ValidationResult {
+  const books = buildRetrievedBooks(sources);
+  const allHaystack = books.map(b => b.haystack).join(' ');
+  let droppedCards = 0, dequotedSpans = 0, droppedLinks = 0, verifiedUnits = 0;
+  let hadCitations = false;
+
+  // 1) Validate the [[مراجع]] cards.
+  const refMatch = answer.match(/\[\[مراجع\]\]([\s\S]*?)(?=\[\[متابعة\]\]|$)/);
+  if (refMatch) {
+    const lines = refMatch[1].split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const kept: string[] = [];
+    for (const line of lines) {
+      const cleanLine = line.replace(/^[-*•\d.)\s]+/, '').trim();
+      if (!cleanLine) continue;
+      let title = '', excerpt = '';
+      if (cleanLine.includes('|')) {
+        for (const p of cleanLine.split('|').map(p => p.trim())) {
+          if (/^(?:الكتاب|المتن|المرجع)\s*[:：]/i.test(p)) title = p.replace(/^(?:الكتاب|المتن|المرجع)\s*[:：]\s*/i, '').trim();
+          else if (/^(?:النص|الشاهد|نص المتن)\s*[:：]/i.test(p)) excerpt = p.replace(/^(?:النص|الشاهد|نص المتن)\s*[:：]\s*/i, '').trim();
+          else if (!title) title = p;
+          else if (!excerpt) excerpt = p;
+        }
+      } else {
+        const ci = cleanLine.indexOf(':');
+        if (ci > 0) { title = cleanLine.slice(0, ci).trim(); excerpt = cleanLine.slice(ci + 1).trim(); }
+        else { title = cleanLine; }
+      }
+      const book = books.find(b => titleMatchesBook(title, b));
+      const ok = !!book && !!excerpt && quoteInHaystack(excerpt, book.haystack);
+      if (ok) { kept.push(line); verifiedUnits++; }
+      else { droppedCards++; hadCitations = true; }
+    }
+    if (kept.length > 0) {
+      answer = answer.replace(refMatch[0], '[[مراجع]]\n' + kept.join('\n') + '\n');
+      hadCitations = true;
+    } else {
+      // No verified cards: remove the whole references block so nothing is labeled verified.
+      answer = answer.replace(/\[\[مراجع\]\][\s\S]*?(?=\[\[متابعة\]\]|$)/, '').trim();
+    }
+  }
+
+  // 2) Validate inline shamela.ws links against retrieved book IDs.
+  answer = answer.replace(/\[([^\]]*)\]\(https:\/\/shamela\.ws\/book\/(\d+)[^)]*\)/g,
+    (whole, label, idStr) => {
+      hadCitations = true;
+      if (books.some(b => b.id === Number(idStr))) { verifiedUnits++; return whole; }
+      droppedLinks++;
+      return label;
+    });
+
+  // 3) Validate inline «...» quotes outside the references block: keep marks only
+  //    when the words appear verbatim in retrieved text; otherwise de-quote
+  //    (the text stays as the model's own words, never as a quotation).
+  const refsBlock = answer.match(/\[\[مراجع\]\][\s\S]*?(?=\[\[متابعة\]\]|$)/)?.[0] || '';
+  const marked = refsBlock ? answer.replace(refsBlock, '\u0000REFS\u0000') : answer;
+  const validatedBody = marked.replace(/«([^»]+)»/g, (whole, q) => {
+    const nq = normalizeArabic(q);
+    if (nq.length < 15) return whole; // short quoted phrases are not load-bearing citations
+    hadCitations = true;
+    if (allHaystack && quoteInHaystack(q, allHaystack)) { verifiedUnits++; return whole; }
+    dequotedSpans++;
+    return q;
+  });
+  answer = refsBlock ? validatedBody.replace('\u0000REFS\u0000', refsBlock) : validatedBody;
+
+  return { text: answer, hadCitations, verifiedUnits, droppedCards, dequotedSpans, droppedLinks };
+}
+
 /** Greetings / very short small-talk skip retrieval and the abstention rule. */
 function isTrivialMessage(text: string): boolean {
   const t = text.trim();
@@ -462,7 +606,25 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    const finalText = fullText || fallbackText;
+    let finalText = fullText || fallbackText;
+    // Server-side citation validation: only citations backed by text retrieved in
+    // THIS request may be presented as verified. If the model claimed citations and
+    // none survived verification on a real question, abstain instead of answering
+    // unsupported.
+    if (finalText) {
+      const ragSources = rag.ok ? rag.sources : [];
+      const v = validateAnswerCitations(finalText, ragSources);
+      if (v.droppedCards || v.dequotedSpans || v.droppedLinks) {
+        console.log(`citation validation: droppedCards=${v.droppedCards} dequoted=${v.dequotedSpans} droppedLinks=${v.droppedLinks} verified=${v.verifiedUnits}`);
+      }
+      if (v.hadCitations && v.verifiedUnits === 0 && !trivial) {
+        res.write(`data: ${JSON.stringify({ error: 'لم تتحقق المصادر لهذه الإجابة من النصوص المسترجعة، فلا أقدّمها إليك غير موثقة. جرّب إعادة السؤال بصياغة أخرى.' })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+      finalText = v.text;
+    }
     if (finalText) {
       // Chunk out the completed answer smoothly
       const chunkSize = 20;
