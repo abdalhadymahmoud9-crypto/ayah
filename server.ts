@@ -170,24 +170,33 @@ app.post('/api/chat', async (req, res) => {
     ];
 
     let stream: any = null;
+    let fullText: string | null = null;
     let fallbackText: string | null = null;
     let lastError: any = null;
-    let wroteAny = false;
+    const deadline = Date.now() + 120000; // overall cap across all model attempts
 
     for (const model of candidateModels) {
-      if (isAborted) break;
+      if (isAborted || Date.now() > deadline) break;
       stream = null;
 
       for (let attempt = 0; attempt < 2; attempt++) {
         if (isAborted) break;
         try {
-          stream = await ai.models.generateContentStream({
-            model,
-            contents,
-            config: {
-              systemInstruction: systemPrompt,
-            },
-          });
+          const initRemaining = Math.max(deadline - Date.now(), 1000);
+          stream = await Promise.race([
+            ai.models.generateContentStream({
+              model,
+              contents,
+              config: {
+                systemInstruction: systemPrompt,
+              },
+            }),
+            new Promise<never>((_, reject) => setTimeout(() => {
+              const e: any = new Error('Stream init timeout (deadline-bounded)');
+              e.status = 'CHUNK_TIMEOUT';
+              reject(e);
+            }, Math.min(45000, initRemaining))),
+          ]);
           break;
         } catch (err: any) {
           lastError = err;
@@ -210,81 +219,96 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-      // If streaming was established, stream chunks out.
-      // A mid-stream failure or stall must NOT finalize a partial answer:
-      // - if nothing was sent to the client yet, fall through to the next model;
-      // - if partial text already went out, tell the client the answer was
-      //   interrupted so it shows an error instead of a fake-complete reply.
+      // If streaming was established, BUFFER the full answer before sending
+      // anything to the client. A mid-stream failure or stall then cleanly
+      // fails over to the next model: partial output is never sent, so the
+      // client can never show a truncated answer as complete, and no two
+      // model answers are ever stitched together.
       if (stream) {
         let chunkTimer: ReturnType<typeof setTimeout> | null = null;
         const CHUNK_TIMEOUT_MS = 45000;
+        let buffered = '';
         try {
           const iterator = stream[Symbol.asyncIterator]();
           while (true) {
             if (isAborted) break;
+            const remainingMs = Math.max(deadline - Date.now(), 1000);
+            const thisChunkTimeout = Math.min(CHUNK_TIMEOUT_MS, remainingMs);
             const timeoutPromise = new Promise<never>((_, reject) => {
               chunkTimer = setTimeout(() => {
-                const e: any = new Error('No chunk received within ' + CHUNK_TIMEOUT_MS + 'ms');
+                const e: any = new Error('Chunk wait exceeded ' + thisChunkTimeout + 'ms (deadline-bounded)');
                 e.status = 'CHUNK_TIMEOUT';
                 reject(e);
-              }, CHUNK_TIMEOUT_MS);
+              }, thisChunkTimeout);
             });
+            if (Date.now() > deadline) {
+              if (chunkTimer) clearTimeout(chunkTimer);
+              const e: any = new Error('Overall deadline exceeded');
+              e.status = 'DEADLINE';
+              throw e;
+            }
             const next = await Promise.race([iterator.next(), timeoutPromise]);
             if (chunkTimer) clearTimeout(chunkTimer);
             if (next.done) break;
             const text = next.value?.text;
             if (text) {
-              res.write(`data: ${JSON.stringify({ text })}\n\n`);
-              wroteAny = true;
+              buffered += text;
             }
           }
-          stream = null; // consumed successfully
-          break;
+          stream = null; // consumed
+          if (isAborted) break;
+          if (buffered.trim().length > 0) {
+            fullText = buffered;
+            break;
+          }
+          // Empty answer from this model is not accepted; try the fallback below, then next model.
+          lastError = new Error('Empty answer from model');
         } catch (streamErr: any) {
           if (chunkTimer) clearTimeout(chunkTimer);
           lastError = streamErr;
           console.error('Error during chunk streaming:', streamErr);
           stream = null;
-          if (wroteAny) {
-            const st = streamErr?.status || streamErr?.code;
-            const friendly = 'انقطع الاتصال بالنموذج أثناء توليد الإجابة' +
-              (st ? ` (رمز الخطأ: ${st})` : '') +
-              '. هذه ليست إجابة مكتملة، يرجى إعادة إرسال سؤالك.';
-            res.write(`data: ${JSON.stringify({ error: friendly })}\n\n`);
-            res.end();
-            return;
-          }
-          // Nothing was written for this model; try non-streaming fallback below, then next model.
+          // Nothing was sent to the client; try non-streaming fallback below, then next model.
         }
       }
 
       // If streaming failed before any output, try standard non-streaming generateContent on this model
-      try {
-        const directRes = await ai.models.generateContent({
-          model,
-          contents,
-          config: {
-            systemInstruction: systemPrompt,
-          },
-        });
-        if (directRes.text) {
-          fallbackText = directRes.text;
-          break;
+      if (Date.now() <= deadline) {
+        try {
+          const directRes = await Promise.race([
+            ai.models.generateContent({
+              model,
+              contents,
+              config: {
+                systemInstruction: systemPrompt,
+              },
+            }),
+            new Promise<never>((_, reject) => setTimeout(() => {
+              const e: any = new Error('Non-streaming fallback timeout');
+              e.status = 'CHUNK_TIMEOUT';
+              reject(e);
+            }, Math.min(45000, Math.max(deadline - Date.now(), 1000)))),
+          ]);
+          if (directRes.text) {
+            fallbackText = directRes.text;
+            break;
+          }
+        } catch (err: any) {
+          lastError = err;
         }
-      } catch (err: any) {
-        lastError = err;
       }
     }
 
-    if (fallbackText) {
-      // Chunk out the fallback text smoothly
+    const finalText = fullText || fallbackText;
+    if (finalText) {
+      // Chunk out the completed answer smoothly
       const chunkSize = 20;
-      for (let i = 0; i < fallbackText.length; i += chunkSize) {
+      for (let i = 0; i < finalText.length; i += chunkSize) {
         if (isAborted) break;
-        const slice = fallbackText.slice(i, i + chunkSize);
+        const slice = finalText.slice(i, i + chunkSize);
         res.write(`data: ${JSON.stringify({ text: slice })}\n\n`);
       }
-    } else if (!wroteAny) {
+    } else {
       let friendlyError = 'تعذر الوصول إلى نماذج الذكاء الاصطناعي حالياً، يرجى المحاولة بعد لحظات.';
       const errMsg = lastError?.message || '';
       if (lastError?.status === 429 || errMsg.includes('Quota exceeded') || errMsg.includes('RESOURCE_EXHAUSTED')) {
