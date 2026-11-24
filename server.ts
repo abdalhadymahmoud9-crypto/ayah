@@ -241,6 +241,7 @@ export function dialectExpand(text: string): { msaQuery: string; keywords: strin
 
 let understandBlockedUntil = 0; // skip the rewrite call briefly after it failed (avoids stacking latency in a provider wave)
 
+const DIAG_ENABLED = true; // public diagnostic payload disabled by default (privacy review)
 export interface Understanding { inScope: boolean; msa: string; keywords: string[]; alts: string[]; }
 
 async function understandQuestion(ai: GoogleGenAI, text: string, prior: string, budgetMs = 6000): Promise<Understanding | null> {
@@ -336,7 +337,9 @@ const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان �
 - إن كانت رسالة المستخدم رغبة أو جملة عامة غير محددة (مثل «عاوز أتجوز» أو «عايز أتوب») وليست مسألة شرعية واضحة، فلا تسرد أحكاماً غير مرتبطة بها؛ اسأل سؤالاً توضيحياً واحداً قصيراً بلغة المستخدم عمّا يريد معرفته (شروط؟ آداب؟ خطوات؟) واذكر باختصار ما يمكنك المساعدة فيه، ولا تخترع نصوصاً.
 - إن لم تتعلق الفقرات المسترجعة بسؤال المستخدم فعلاً، فقل ذلك صراحة ولا تستشهد بها.
 - إذا ذكرت الفقرة خلافاً بين العلماء (مثل «على الصحيح» أو «وعند آخرين» أو «الأحوط» أو «اختلاف») فاذكر الخلاف وقيد الحكم بنطاقه وشرطه كما ورد، ولا تعمّم القول الراجح عند عالم بعينه على أنه حكم متفق عليه. ولا تقل «أجمع أهل العلم» أو «بالإجماع» أو «عند الجمهور» إلا إذا نصّت الفقرة المسترجعة نفسها على ذلك. انسب كل قول لقائله وكتابه كما ورد في الفقرة.
-- انتبه لحالة السائل في الفقرة: إن كانت الفقرة تجيب عن حالة مختلفة عن حالة المستخدم (مثل عقد نكاح قائم منذ سنوات مقابل زواج لم يتم بعد، أو جهل مقابل تهاون) فلا تطبّقها على المستخدم كأنها حكم مسألته؛ اذكر الفرق صراحة، أو اطلب منه توضيح حالته بسؤال واحد قصير. ولا تملأ الجواب بنصائح عامة غير موثقة بدل الجواب.`;
+- انتبه لحالة السائل في الفقرة: إن كانت الفقرة تجيب عن حالة مختلفة عن حالة المستخدم (مثل عقد نكاح قائم منذ سنوات مقابل زواج لم يتم بعد، أو جهل مقابل تهاون) فلا تطبّقها على المستخدم كأنها حكم مسألته؛ اذكر الفرق صراحة، أو اطلب منه توضيح حالته بسؤال واحد قصير. ولا تملأ الجواب بنصائح عامة غير موثقة بدل الجواب.
+- في فتاوى (س: ... ج: ...) ما بعد «س:» هو كلام السائل وافتراضه وليس حكم العالم؛ لا تنسب إلى العالم إلا ما جاء بعد «ج:». فإن قال السائل «العقد باطل» وأجاب العالم بأن المسألة خلافية فانقل الخلاف ولا تنقل قول السائل حكماً.
+- لا تُدخل في جواب سؤال عام حكم مسألة فرعية (مثل ترك الصلاة) إلا إن سأل عنها المستخدم، ولا تحذف من الفقرة قيد «على الصحيح، وعند آخرين ...» عند نقل الحكم.`;
 
 /* ---- Server-side citation validation: no citation is presented as verified
  * unless it is backed by text actually retrieved in THIS request. ---- */
@@ -737,7 +740,8 @@ app.post('/api/chat', async (req, res) => {
     // keywords: model's standard-Arabic terms; else dictionary terms; else the question's own content words
     const relKeywords = (und && und.keywords.length) ? und.keywords : (dia.keywords.length ? dia.keywords : queryTokens.slice(0, 5));
     lastRelKeywords = relKeywords;
-    const queries = msaQuery ? [msaQuery, ...((und && und.alts) || []), lastUserText] : [lastUserText];
+    const titleVariant = lastUserText.replace(/[؟?]/g, ' ').replace(/^\s*(هل\s+يجوز|هل\s+يصح|هل\s+يحل|ما\s+حكم|ايه\s+حكم|إيه\s+حكم|حكم)\s+/, 'حكم ').replace(/\s+/g, ' ').trim();
+    const queries = msaQuery ? [msaQuery, ...((und && und.alts) || []), ...(titleVariant !== lastUserText.trim() ? [titleVariant] : []), lastUserText] : [lastUserText];
     const tRet0 = Date.now();
     rag = await retrieveMulti(queries, 8000);
     const tRetrieve = Date.now() - tRet0;
@@ -751,7 +755,7 @@ app.post('/api/chat', async (req, res) => {
       relevantCount = rel.length;
       relevantKeys = new Set(strongRelevant(rel, relKeywords).map(x => x.book_id + ':' + x.page_id));
     }
-    if (diag === true && !trivial) {
+    if (DIAG_ENABLED && diag === true && !trivial) {
       // Opt-in audit event for evaluation only: returned to the requester, never logged server-side.
       const dsrc = rag.ok ? rag.sources : [];
       res.write(`data: ${JSON.stringify({ diag: { model: und ? { msa: und.msa, keywords: und.keywords } : null, dialect: { msa: msaQuery, keywords: dia.keywords }, relKeywords, queries, ok: rag.ok, passages: dsrc.map(x => ({ book_id: x.book_id, page_id: x.page_id, shown: !relevantKeys || relevantKeys.has(x.book_id + ':' + x.page_id), text: x.text.slice(0, 2500) })) } })}\n\n`);
