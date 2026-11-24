@@ -215,6 +215,7 @@ const DIALECT_MAP: Record<string, string> = {
   'فلوس': 'مال', 'فايده': 'ربا فائده', 'الفايده': 'ربا فائده', 'بنك': 'ربا بنوك', 'البنك': 'ربا بنوك',
   'سجاير': 'تدخين', 'سيجاره': 'تدخين', 'شيشه': 'تدخين', 'اغاني': 'غناء معازف', 'الاغاني': 'غناء معازف',
   'موسيقي': 'معازف غناء', 'الموسيقي': 'معازف غناء', 'تصوير': 'تصوير صور', 'حجاب': 'حجاب خمار',
+  'ماتصليش': 'ترك الصلاه لا تصلي', 'مابتصليش': 'ترك الصلاه لا تصلي', 'مبتصليش': 'ترك الصلاه لا تصلي', 'متصليش': 'ترك الصلاه لا تصلي', 'بتصلي': 'تصلي',
   'جزمه': 'حذاء نعل خف', 'اصلي': 'صلاه صلي', 'هصلي': 'صلاه صلي', 'اصوم': 'صيام صوم', 'افطر': 'افطار صيام', 'لابس': 'لبس', 'جزمتي': 'حذاء نعل خف',
   'ينفع': 'يجوز', 'ازاي': 'كيف', 'اقرا': 'قراءه', 'ادعي': 'دعاء',
 };
@@ -325,7 +326,8 @@ function buildEvidenceBlock(sources: RagSource[]): string {
 const RAG_SYSTEM_ADDITION = `\n\nتصلك أحياناً فقرة بعنوان «نصوص موثقة مسترجعة من المكتبة الشاملة» ضمن سؤال المستخدم. هذه النصوص هي المصدر الوحيد الجائز للنقل الحرفي والتوثيق:\n- انقل فقط من هذه الفقرات، ولا تنقل من حفظك أي نص من كتاب، ولو كنت واثقاً منه.\n- عزو كل نقلة يكون حرفياً كما ورد في سطر التوثيق المرفق (الكتاب، المجلد، الصفحة، الرابط)، وأرفق رابط الشاملة الكامل نفسه في خانة الموضع لكل مرجع؛ فالمرجع بلا رابط يُحذف آلياً.\n- إن لم تكن الفقرات المسترجعة تنص على جواب المسألة فلا تستشهد بها، وقل صراحة إن المراجع المتاحة لم تنص على الجواب.\n- كل معلومة أو نسبة لعالم أو كتاب تذكرها خارج علامات الاقتباس يجب أن تكون مما ورد صراحة في الفقرات المسترجعة؛ لا تضف تفصيلاً أو عزواً أو اسم كتاب لم يرد فيها، وإن لم يرد فصرّح بأنه لم يرد في المصادر المسترجعة.
 - لا تُدرج في قسم المتون والمراجع أي كتاب أو مجلد أو صفحة لم ترد في الفقرات المسترجعة.
 - إن كانت رسالة المستخدم رغبة أو جملة عامة غير محددة (مثل «عاوز أتجوز» أو «عايز أتوب») وليست مسألة شرعية واضحة، فلا تسرد أحكاماً غير مرتبطة بها؛ اسأل سؤالاً توضيحياً واحداً قصيراً بلغة المستخدم عمّا يريد معرفته (شروط؟ آداب؟ خطوات؟) واذكر باختصار ما يمكنك المساعدة فيه، ولا تخترع نصوصاً.
-- إن لم تتعلق الفقرات المسترجعة بسؤال المستخدم فعلاً، فقل ذلك صراحة ولا تستشهد بها.`;
+- إن لم تتعلق الفقرات المسترجعة بسؤال المستخدم فعلاً، فقل ذلك صراحة ولا تستشهد بها.
+- إذا ذكرت الفقرة خلافاً بين العلماء (مثل «على الصحيح» أو «وعند آخرين» أو «الأحوط» أو «اختلاف») فاذكر الخلاف وقيد الحكم بنطاقه وشرطه كما ورد، ولا تعمّم القول الراجح عند عالم بعينه على أنه حكم متفق عليه. ولا تقل «أجمع أهل العلم» أو «بالإجماع» أو «عند الجمهور» إلا إذا نصّت الفقرة المسترجعة نفسها على ذلك. انسب كل قول لقائله وكتابه كما ورد في الفقرة.`;
 
 /* ---- Server-side citation validation: no citation is presented as verified
  * unless it is backed by text actually retrieved in THIS request. ---- */
@@ -457,6 +459,22 @@ export function buildOutageFallback(sources: RagSource[], keywords: string[] = [
     + buildExtractiveFallback(sources, keywords).split('\n\n').slice(1).join('\n\n');
 }
 
+
+/** Lines that assert consensus/majority ("أجمع", "إجماع", "جمهور", "باتفاق") in the model's own prose (outside quoted passages)
+ * get an explicit qualifier: word presence in some retrieved passage does not prove the same claim, so we do not claim it was verified. */
+export function qualifyConsensusClaims(text: string): { text: string; qualified: number } {
+  let n = 0;
+  const TERM = /(أجمع|اجمع|إجماع|اجماع|جمهور|باتفاق|بالاتفاق|متفق عليه|لا خلاف)/;
+  const out = text.split('\n').map(line => {
+    if (line.startsWith('[[') || line.includes('shamela.ws')) return line;
+    const bare = line.replace(/«[^»]*»/g, '').replace(/"[^"]*"/g, '');
+    if (!TERM.test(bare)) return line;
+    if (line.includes('لم يُتحقق من نصّ المصدر')) return line;
+    n++;
+    return line + ' (تنبيه: عبارة الإجماع/الجمهور هنا لم يُتحقق من نصّ المصدر على ثبوتها؛ قد يوجد خلاف، فراجع النصوص الموثقة أدناه.)';
+  });
+  return { text: out.join('\n'), qualified: n };
+}
 
 /** Remove "(كما في X)" style attributions naming a book that was not retrieved in this request. */
 export function stripUnsupportedAttributions(text: string, sources: RagSource[]): { text: string; removed: number } {
@@ -613,7 +631,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.post('/api/chat', async (req, res) => {
-  const { messages, style = 'detailed', madhhab = 'none' } = req.body;
+  const { messages, style = 'detailed', madhhab = 'none', diag = false } = req.body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     res.status(400).json({ error: 'قائمة الرسائل غير صالحة أو فارغة.' });
@@ -723,6 +741,11 @@ app.post('/api/chat', async (req, res) => {
       rag = { ok: true, sources: [...rel, ...rag.sources.filter(x => !relSet.has(x))].slice(0, 15) };
       relevantCount = rel.length;
       relevantKeys = new Set(strongRelevant(rel, relKeywords).map(x => x.book_id + ':' + x.page_id));
+    }
+    if (diag === true && !trivial) {
+      // Opt-in audit event for evaluation only: returned to the requester, never logged server-side.
+      const dsrc = rag.ok ? rag.sources : [];
+      res.write(`data: ${JSON.stringify({ diag: { model: und ? { msa: und.msa, keywords: und.keywords } : null, dialect: { msa: msaQuery, keywords: dia.keywords }, relKeywords, queries, ok: rag.ok, passages: dsrc.map(x => ({ book_id: x.book_id, page_id: x.page_id, shown: !relevantKeys || relevantKeys.has(x.book_id + ':' + x.page_id), text: x.text.slice(0, 2500) })) } })}\n\n`);
     }
     if (!rag.ok && !trivial) {
       const msg = rag.reason === 'empty'
@@ -900,6 +923,8 @@ app.post('/api/chat', async (req, res) => {
       finalText = v.text;
       const att = stripUnsupportedAttributions(finalText, ragSources);
       if (att.removed) { console.log(`attribution check: removed ${att.removed} unsupported book attribution(s)`); finalText = att.text; }
+      const cq = qualifyConsensusClaims(finalText);
+      if (cq.qualified) { console.log(`consensus check: qualified ${cq.qualified} line(s)`); finalText = cq.text; }
       if (!trivial && v.verifiedUnits === 0 && ragSources.length > 0) {
         const shownX = relevantKeys ? ragSources.filter(x => relevantKeys!.has(x.book_id + ':' + x.page_id)) : ragSources;
         finalText = shownX.length > 0 ? buildExtractiveFallback(shownX) : 'لا أملك إجابة موثقة على هذا السؤال، والبحث النصي لم يُرجع فقرات تشترك مع كلمات سؤالك المفتاحية. هذا لا يعني أن المصادر المعتمدة تخلو من الجواب؛ جرّب صياغة أخرى للسؤال.';
