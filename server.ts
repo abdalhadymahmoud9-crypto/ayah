@@ -484,10 +484,27 @@ export function isContestedTopic(q: string): boolean {
   if (/(بطلان|صحه) (عقد|نكاح|الزواج)|(شروط|اركان) (صحه )?(عقد|نكاح)/.test(t)) return true;
   return false;
 }
-export function buildExcerptMode(sources: RagSource[], keywords: string[]): string {
+/** Applicability gate for excerpt mode: per matched topic, every concept group must appear in the (normalized) passage. Fail-closed. */
+export function topicGroups(q: string): RegExp[][] {
+  const t = normalizeArabic(q);
+  const out: RegExp[][] = [];
+  const prayer = /(تصلي|تصلين|تارك[هةا]? الصلاه|ترك الصلاه|لا يصلي|لايصلي|ماتصلي|ما تصلي|ماتصليش|بتصلي|مبتصل|مش بتصل|مابتصل)/.test(t);
+  const marriage = /(زواج|تزوج|اتجوز|نكاح|عقد|زوج[هةا]?\b|مراتي|جوزي|زوجتي|خطيبتي)/.test(t);
+  if (prayer && marriage) out.push([/((لا|لم|ما|مش) (تصلي|يصلي|تصلين|تصل)|تارك[هةا]? الصلاه|ترك الصلاه|تركت الصلاه|تاركه للصلاه|لا تقيم الصلاه|مبتصل)/, /(زواج|تزوج|نكاح|زوجه|زوجها|زوجته|زوجت|التزوج|عقد)/]);
+  if (/(تكفير|اكفر|يكفر|حكم تارك الصلاه|حكم ترك الصلاه)/.test(t)) out.push([/(كفر|تكفير|كافر)/]);
+  if (/(طلاق|تطليق|اطلق|يقع الطلاق|ايمان الطلاق)/.test(t)) out.push([/(طلاق|طلق)/]);
+  if (/(بطلان|صحه) (عقد|نكاح|الزواج)|(شروط|اركان) (صحه )?(عقد|نكاح)/.test(t)) out.push([/(عقد|نكاح)/, /(بطلان|باطل|صحه|صحيح|شرط|شروط|ركن|اركان|فساد|ولي|شاهد)/]);
+  return out;
+}
+export function passageApplicable(text: string, groups: RegExp[][]): boolean {
+  const h = normalizeArabic(text);
+  return groups.some(g => g.every(re => re.test(h)));
+}
+export function buildExcerptMode(sources: RagSource[], keywords: string[], question = ''): string {
   const lab = (t: string) => t.replace(/\s+/g, ' ').replace(/(^|\s)س\s*:/g, '$1[سؤال السائل: سياق وليس حكماً] ').replace(/(^|\s)ج\s*:/g, '\n[جواب العالم] ');
   const strong = new Set(strongRelevant(sources, keywords).map(x => x.book_id + ':' + x.page_id));
-  const pick = keywords.length > 0 ? sources.filter(x => strong.has(x.book_id + ':' + x.page_id)).slice(0, 4) : [];
+  const groups = topicGroups(question);
+  const pick = groups.length > 0 ? sources.filter(x => passageApplicable(x.text, groups)).sort((x, y) => Number(strong.has(y.book_id + ':' + y.page_id)) - Number(strong.has(x.book_id + ':' + x.page_id))).slice(0, 4) : [];
   if (pick.length === 0) return 'هذه مسألة خلافية، ولن أصوغ فيها حكماً بكلامي. لم أجد في المصادر المعتمدة نصاً مطابقاً لصياغة سؤالك. جرّب صياغة أقرب لعنوان الفتوى (مثل «حكم الزواج من امرأة لا تصلي»)، أو راجع عالماً ثقة.';
   const parts = pick.map(x => {
     const clean = lab(x.text.trim());
@@ -502,7 +519,7 @@ export function buildExcerptMode(sources: RagSource[], keywords: string[]): stri
     }
     return `${x.citationMarkdown}\n«${clean.slice(0, 1500)} […اقتُطع باقي النص، راجع المصدر الكامل في الرابط]»`;
   });
-  return 'هذه مسألة خلافية، ولذلك أعرض لك نصوص المصادر نفسها كما وردت بدل أن أصوغ لك حكماً بكلامي. هذه مقتطفات من المصادر المسترجعة وليست إجابة مُركّبة؛ وهي نتيجة بحث آلي قد لا ينطبق بعضها على حالتك. انتبه لعبارات الخلاف والقيود الواردة فيها مثل «على الصحيح» و«وعند آخرين»، ولما بعد «سؤال السائل» فهو كلام السائل لا العالم، ولحالة السائل فقد تختلف عن حالتك. راجع عالماً ثقة في حالتك.\n\n'
+  return 'هذه مسألة خلافية، ولذلك أعرض لك نصوص المصادر نفسها كما وردت بدل أن أصوغ لك حكماً بكلامي. هذه مقتطفات من المصادر المسترجعة وليست إجابة مُركّبة؛ وهي نتيجة بحث آلي قد لا ينطبق بعضها على حالتك. انتبه لعبارات الخلاف والقيود الواردة فيها مثل «على الصحيح» و«وعند آخرين»، ولما بعد «سؤال السائل» فهو كلام السائل لا العالم، ولحالة السائل فقد تختلف عن حالتك. راجع عالماً ثقة في حالتك. وقد تنتهي بعض المقتطفات بلا اكتمال لأن المصدر المسترجع مقتطع؛ فراجع الرابط للنص الكامل.\n\n'
     + parts.join('\n\n');
 }
 
@@ -813,7 +830,7 @@ app.post('/api/chat', async (req, res) => {
     }
     if (rag.ok && !trivial && isContestedTopic(lastUserText + ' ' + (msaQuery || ''))) {
       console.log('timing excerpt-mode (contested topic, no generation)');
-      res.write(`data: ${JSON.stringify({ text: buildExcerptMode(rag.sources, relKeywords) })}\n\n`);
+      res.write(`data: ${JSON.stringify({ text: buildExcerptMode(rag.sources, relKeywords, lastUserText + ' ' + (msaQuery || '')) })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       return;
