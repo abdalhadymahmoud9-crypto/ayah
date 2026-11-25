@@ -862,6 +862,7 @@ app.post('/api/chat', async (req, res) => {
     let lastError: any = null;
     const deadline = Date.now() + 120000; // overall cap across all model attempts
 
+    const tGenStart = Date.now();
     for (const model of candidateModels) {
       if (isAborted || Date.now() > deadline) break;
       stream = null;
@@ -887,6 +888,7 @@ app.post('/api/chat', async (req, res) => {
           break;
         } catch (err: any) {
           lastError = err;
+          console.log(`timing model-init-failed model=${model} status=${err?.status || err?.code} at=${Date.now() - tGenStart}ms`);
           const status = err?.status || err?.code;
           const msg = err?.message || '';
 
@@ -911,6 +913,8 @@ app.post('/api/chat', async (req, res) => {
         let chunkTimer: ReturnType<typeof setTimeout> | null = null;
         const CHUNK_TIMEOUT_MS = 45000;
         let buffered = '';
+        let tFirstChunk = 0;
+        let lastUsage: any = null;
         try {
           const iterator = stream[Symbol.asyncIterator]();
           while (true) {
@@ -934,6 +938,8 @@ app.post('/api/chat', async (req, res) => {
             if (chunkTimer) clearTimeout(chunkTimer);
             if (next.done) break;
             const text = next.value?.text;
+            if (!tFirstChunk) tFirstChunk = Date.now() - tGenStart;
+            if (next.value?.usageMetadata) lastUsage = next.value.usageMetadata;
             if (text) {
               buffered += text;
             }
@@ -942,6 +948,7 @@ app.post('/api/chat', async (req, res) => {
           if (isAborted) break;
           if (buffered.trim().length > 0) {
             fullText = buffered;
+            console.log(`timing generate model=${model} firstChunk=${tFirstChunk}ms total=${Date.now() - tGenStart}ms chars=${buffered.length} usage=${JSON.stringify(lastUsage)}`);
             break;
           }
           // Empty answer from this model is not accepted; try the fallback below, then next model.
