@@ -10,6 +10,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+
+// Models that just failed (503/429/hang) are skipped for a short time on this instance,
+// so repeated requests do not pay the same timeout again. Order of the chain is unchanged.
+const modelCooldown = new Map<string, number>();
+const MODEL_COOLDOWN_MS = 90000;
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
@@ -863,7 +868,10 @@ app.post('/api/chat', async (req, res) => {
     const deadline = Date.now() + 120000; // overall cap across all model attempts
 
     const tGenStart = Date.now();
-    for (const model of candidateModels) {
+    const coolModels = candidateModels.filter(m => (modelCooldown.get(m) || 0) <= Date.now());
+    const tryModels = coolModels.length > 0 ? coolModels : candidateModels;
+    if (coolModels.length < candidateModels.length) console.log(`timing skipped-cooling-models=${candidateModels.length - coolModels.length}`);
+    for (const model of tryModels) {
       if (isAborted || Date.now() > deadline) break;
       stream = null;
 
@@ -883,11 +891,12 @@ app.post('/api/chat', async (req, res) => {
               const e: any = new Error('Stream init timeout (deadline-bounded)');
               e.status = 'CHUNK_TIMEOUT';
               reject(e);
-            }, Math.min(45000, initRemaining))),
+            }, Math.min(20000, initRemaining))),
           ]);
           break;
         } catch (err: any) {
           lastError = err;
+          modelCooldown.set(model, Date.now() + MODEL_COOLDOWN_MS);
           console.log(`timing model-init-failed model=${model} status=${err?.status || err?.code} at=${Date.now() - tGenStart}ms`);
           const status = err?.status || err?.code;
           const msg = err?.message || '';
@@ -956,6 +965,7 @@ app.post('/api/chat', async (req, res) => {
         } catch (streamErr: any) {
           if (chunkTimer) clearTimeout(chunkTimer);
           lastError = streamErr;
+          modelCooldown.set(model, Date.now() + MODEL_COOLDOWN_MS);
           console.error('Error during chunk streaming:', streamErr);
           stream = null;
           // Nothing was sent to the client; try non-streaming fallback below, then next model.
@@ -967,7 +977,7 @@ app.post('/api/chat', async (req, res) => {
       // so a second call to it only adds latency (measured) without a realistic chance.
       const st = lastError?.status || lastError?.code;
       const m = lastError?.message || '';
-      const overloaded = st === 503 || st === 429 || m.includes('high demand') || m.includes('UNAVAILABLE') || m.includes('Quota exceeded');
+      const overloaded = st === 503 || st === 429 || st === 'CHUNK_TIMEOUT' || m.includes('high demand') || m.includes('UNAVAILABLE') || m.includes('Quota exceeded');
       if (Date.now() <= deadline && !overloaded) {
         try {
           const directRes = await Promise.race([
