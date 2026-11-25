@@ -1076,4 +1076,10 @@ async function startServer() {
   });
 }
 
-startServer();
+// On Vercel the platform serves the built UI and runs this app as a function (see api/index.ts),
+// so only start the long-running listener elsewhere (local dev, other hosts).
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;
