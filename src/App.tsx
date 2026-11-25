@@ -505,7 +505,7 @@ export default function App() {
   return (
     <>
       <aside id="side" className={isSidebarOpen ? 'on' : ''}>
-        <div className="brand">AYAH (آية)</div>
+        <div className="brand" style={{display:'flex',alignItems:'center',gap:6}}><img src="/assets/aistudio/App_icon_and_favicon_1x_8a38fada.png" alt="" aria-hidden="true" width={40} height={40} style={{width:40,height:40,objectFit:'contain',flexShrink:0}} /><span>AYAH (آية)</span></div>
 
         <button className="sbtn" id="new" onClick={startNewChat}>
           ✎ محادثة جديدة
@@ -583,7 +583,7 @@ export default function App() {
           >
             ☰
           </button>
-          <span className="name">AYAH (آية)</span>
+          <span className="name" style={{display:'inline-flex',alignItems:'center',gap:4}}><img src="/assets/aistudio/App_icon_and_favicon_1x_8a38fada.png" alt="" aria-hidden="true" width={32} height={32} style={{width:32,height:32,objectFit:'contain',flexShrink:0}} /><span>AYAH (آية)</span></span>
         </div>
 
         <div id="scroll" ref={scrollContainerRef}>
