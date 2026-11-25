@@ -1,6 +1,7 @@
 import express from 'express';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import { generateWithFailover, PROD } from './failover.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -11,14 +12,10 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Models that just failed (503/429/hang) are skipped for a short time on this instance,
-// so repeated requests do not pay the same timeout again. Order of the chain is unchanged.
-const modelCooldown = new Map<string, number>();
-const MODEL_COOLDOWN_MS = 90000;
-// A healthy model answers the stream request in a few seconds (observed 3 to 5 s in production
-// logs); a model that has not answered by then is treated as hung and the next one is tried.
-const INIT_TIMEOUT_MS = 10000;
-const FIRST_CHUNK_TIMEOUT_MS = 20000;
+let lastGoodModel: string | null = null; // per instance: try the model that last worked first
+function preferLastGood(models: string[]): string[] {
+  return lastGoodModel && models.includes(lastGoodModel) ? [lastGoodModel, ...models.filter(m => m !== lastGoodModel)] : models;
+}
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
@@ -260,15 +257,15 @@ ${prior ? `سياق سابق من المستخدم: «${prior.slice(0, 400)}»` 
 أعد JSON فقط بهذا الشكل:
 {"in_scope": true|false, "msa": "<السؤال بالعربية الفصحى الفقهية الواضحة مع حل الإحالات من السياق>", "keywords": ["<٢ إلى ٦ كلمات مفتاحية فصيحة كما ترد في كتب الفقه والحديث، بجذورها وصيغها الشائعة، مثل: زواج، نكاح، تزوج>"], "alts": ["<عبارتان قصيرتان (٣ إلى ٧ كلمات) بصيغة عناوين الفتاوى كما يكتبها العلماء عادةً، بأشهر أفعال المسألة وصيغها، مثل: «حكم الزواج من امرأة لا تصلي» وليس «لا تقيم الصلاة»>"]}
 in_scope تكون true لأي سؤال عن الدين الإسلامي أو الفقه أو العقيدة أو الحديث أو التفسير أو السيرة أو الأخلاق الشرعية أو معاملات الحياة من منظور شرعي (وإن كُتب بالعامية)، وfalse لغير ذلك (برمجة، رياضة، جغرافيا، ترفيه...). لا تفسّر بأكثر من JSON.`;
-  const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash'];
+  const models = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
   const deadline = Date.now() + budgetMs;
   for (const model of models) {
     const remaining = deadline - Date.now();
     if (remaining < 800) break;
     try {
       const r: any = await Promise.race([
-        ai.models.generateContent({ model, contents: [{ role: 'user', parts: [{ text: prompt }] }], config: { responseMimeType: 'application/json' } }),
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('understand timeout')), Math.min(4000, remaining))),
+        ai.models.generateContent({ model, contents: [{ role: 'user', parts: [{ text: prompt }] }], config: { responseMimeType: 'application/json', httpOptions: { retryOptions: { attempts: 1 } } } }),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('understand timeout')), Math.min(3000, remaining))),
       ]);
       const raw = String(r?.text ?? '').trim();
       const j = JSON.parse(raw.replace(/^```(?:json)?|```$/g, '').trim());
@@ -852,161 +849,29 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
+    // Route: light models only (Google lists Flash-Lite as the fastest and cheapest; production logs showed
+    // the full Flash models returning 503 or hanging). One model at a time, so no extra quota is spent.
+    // A failed or hung model is cancelled and cut by the caps below; the whole answer is buffered, so
+    // partial text never reaches the client. If every model fails within the 120 s deadline (unchanged from
+    // before), the existing sources-only fallback applies.
     const candidateModels = [
-      'gemini-3.1-flash-lite',
-      'gemini-3.5-flash',
-      'gemini-3.7-flash',
-      'gemini-3.8-flash',
-      'gemini-flash-latest',
-      'gemini-flash-lite-latest',
-      'gemini-3.6-flash',
       'gemini-3.5-flash-lite',
-      'gemini-3-flash-preview',
-      'gemini-3.1-flash-lite-preview'
+      'gemini-flash-lite-latest',
+      'gemini-3.1-flash-lite',
     ];
-
-    let stream: any = null;
-    let fullText: string | null = null;
-    let fallbackText: string | null = null;
-    let lastError: any = null;
-    const deadline = Date.now() + 120000; // overall cap across all model attempts
-
     const tGenStart = Date.now();
-    const coolModels = candidateModels.filter(m => (modelCooldown.get(m) || 0) <= Date.now());
-    const tryModels = coolModels.length > 0 ? coolModels : candidateModels;
-    if (coolModels.length < candidateModels.length) console.log(`timing skipped-cooling-models=${candidateModels.length - coolModels.length}`);
-    for (const model of tryModels) {
-      if (isAborted || Date.now() > deadline) break;
-      stream = null;
-
-      for (let attempt = 0; attempt < 2; attempt++) {
-        if (isAborted) break;
-        try {
-          const initRemaining = Math.max(deadline - Date.now(), 1000);
-          stream = await Promise.race([
-            ai.models.generateContentStream({
-              model,
-              contents,
-              config: {
-                systemInstruction: systemPrompt,
-              },
-            }),
-            new Promise<never>((_, reject) => setTimeout(() => {
-              const e: any = new Error('Stream init timeout (deadline-bounded)');
-              e.status = 'CHUNK_TIMEOUT';
-              reject(e);
-            }, Math.min(INIT_TIMEOUT_MS, initRemaining))),
-          ]);
-          break;
-        } catch (err: any) {
-          lastError = err;
-          modelCooldown.set(model, Date.now() + MODEL_COOLDOWN_MS);
-          console.log(`timing model-init-failed model=${model} status=${err?.status || err?.code} at=${Date.now() - tGenStart}ms`);
-          const status = err?.status || err?.code;
-          const msg = err?.message || '';
-
-          // If quota exceeded on this model, immediately try next model
-          if (status === 429 || msg.includes('Quota exceeded') || msg.includes('limit:')) {
-            break;
-          }
-
-          // 503 high demand: the model is overloaded; move straight to the next
-          // model instead of retrying the same one (measured: retries during a
-          // wave fail again, and burn ~2s per attempt).
-          break;
-        }
-      }
-
-      // If streaming was established, BUFFER the full answer before sending
-      // anything to the client. A mid-stream failure or stall then cleanly
-      // fails over to the next model: partial output is never sent, so the
-      // client can never show a truncated answer as complete, and no two
-      // model answers are ever stitched together.
-      if (stream) {
-        let chunkTimer: ReturnType<typeof setTimeout> | null = null;
-        const CHUNK_TIMEOUT_MS = 45000;
-        let buffered = '';
-        let tFirstChunk = 0;
-        let lastUsage: any = null;
-        try {
-          const iterator = stream[Symbol.asyncIterator]();
-          while (true) {
-            if (isAborted) break;
-            const remainingMs = Math.max(deadline - Date.now(), 1000);
-            const thisChunkTimeout = Math.min(tFirstChunk ? CHUNK_TIMEOUT_MS : FIRST_CHUNK_TIMEOUT_MS, remainingMs);
-            const timeoutPromise = new Promise<never>((_, reject) => {
-              chunkTimer = setTimeout(() => {
-                const e: any = new Error('Chunk wait exceeded ' + thisChunkTimeout + 'ms (deadline-bounded)');
-                e.status = 'CHUNK_TIMEOUT';
-                reject(e);
-              }, thisChunkTimeout);
-            });
-            if (Date.now() > deadline) {
-              if (chunkTimer) clearTimeout(chunkTimer);
-              const e: any = new Error('Overall deadline exceeded');
-              e.status = 'DEADLINE';
-              throw e;
-            }
-            const next = await Promise.race([iterator.next(), timeoutPromise]);
-            if (chunkTimer) clearTimeout(chunkTimer);
-            if (next.done) break;
-            const text = next.value?.text;
-            if (!tFirstChunk) tFirstChunk = Date.now() - tGenStart;
-            if (next.value?.usageMetadata) lastUsage = next.value.usageMetadata;
-            if (text) {
-              buffered += text;
-            }
-          }
-          stream = null; // consumed
-          if (isAborted) break;
-          if (buffered.trim().length > 0) {
-            fullText = buffered;
-            console.log(`timing generate model=${model} firstChunk=${tFirstChunk}ms total=${Date.now() - tGenStart}ms chars=${buffered.length} tokens=${JSON.stringify({ prompt: lastUsage?.promptTokenCount, out: lastUsage?.candidatesTokenCount, thoughts: lastUsage?.thoughtsTokenCount })}`);
-            break;
-          }
-          // Empty answer from this model is not accepted; try the fallback below, then next model.
-          lastError = new Error('Empty answer from model');
-        } catch (streamErr: any) {
-          if (chunkTimer) clearTimeout(chunkTimer);
-          lastError = streamErr;
-          modelCooldown.set(model, Date.now() + MODEL_COOLDOWN_MS);
-          console.error('Error during chunk streaming:', streamErr);
-          stream = null;
-          // Nothing was sent to the client; try non-streaming fallback below, then next model.
-        }
-      }
-
-      // If streaming failed before any output, try standard non-streaming generateContent on this model.
-      // Skip when the failure was 503/429: the same model is overloaded or out of quota,
-      // so a second call to it only adds latency (measured) without a realistic chance.
-      const st = lastError?.status || lastError?.code;
-      const m = lastError?.message || '';
-      const overloaded = st === 503 || st === 429 || st === 'CHUNK_TIMEOUT' || m.includes('high demand') || m.includes('UNAVAILABLE') || m.includes('Quota exceeded');
-      if (Date.now() <= deadline && !overloaded) {
-        try {
-          const directRes = await Promise.race([
-            ai.models.generateContent({
-              model,
-              contents,
-              config: {
-                systemInstruction: systemPrompt,
-              },
-            }),
-            new Promise<never>((_, reject) => setTimeout(() => {
-              const e: any = new Error('Non-streaming fallback timeout');
-              e.status = 'CHUNK_TIMEOUT';
-              reject(e);
-            }, Math.min(45000, Math.max(deadline - Date.now(), 1000)))),
-          ]);
-          if (directRes.text) {
-            fallbackText = directRes.text;
-            break;
-          }
-        } catch (err: any) {
-          lastError = err;
-        }
-      }
-    }
+    const fo = await generateWithFailover({
+      models: preferLastGood(candidateModels),
+      start: (model, signal) => ai.models.generateContentStream({ model, contents, config: { systemInstruction: systemPrompt, abortSignal: signal, httpOptions: { retryOptions: { attempts: 1 } } } }),
+      ...PROD,
+      shouldStop: () => isAborted,
+      onAttempt: (a) => console.log(`timing model-attempt model=${a.model} outcome=${a.outcome} ms=${a.ms} firstChunk=${a.firstChunkMs ?? '-'} at=${Date.now() - tGenStart}ms`),
+    });
+    const fullText: string | null = fo.text;
+    const fallbackText: string | null = null;
+    const lastError: any = fo.text ? null : Object.assign(new Error('all models failed or timed out'), { status: fo.attempts.some(x => x.outcome === '429') ? 429 : fo.attempts.some(x => x.outcome === '503') ? 503 : 'CHUNK_TIMEOUT' });
+    if (fo.model) lastGoodModel = fo.model;
+    console.log(`timing generate model=${fo.model || 'none'} total=${Date.now() - tGenStart}ms chars=${fo.text ? fo.text.length : 0} attempts=${fo.attempts.length}`);
 
     let finalText = fullText || fallbackText;
     // Server-side citation validation, fail closed: only citations backed by text
