@@ -15,6 +15,10 @@ const app = express();
 // so repeated requests do not pay the same timeout again. Order of the chain is unchanged.
 const modelCooldown = new Map<string, number>();
 const MODEL_COOLDOWN_MS = 90000;
+// A healthy model answers the stream request in a few seconds (observed 3 to 5 s in production
+// logs); a model that has not answered by then is treated as hung and the next one is tried.
+const INIT_TIMEOUT_MS = 10000;
+const FIRST_CHUNK_TIMEOUT_MS = 20000;
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
@@ -891,7 +895,7 @@ app.post('/api/chat', async (req, res) => {
               const e: any = new Error('Stream init timeout (deadline-bounded)');
               e.status = 'CHUNK_TIMEOUT';
               reject(e);
-            }, Math.min(20000, initRemaining))),
+            }, Math.min(INIT_TIMEOUT_MS, initRemaining))),
           ]);
           break;
         } catch (err: any) {
@@ -929,7 +933,7 @@ app.post('/api/chat', async (req, res) => {
           while (true) {
             if (isAborted) break;
             const remainingMs = Math.max(deadline - Date.now(), 1000);
-            const thisChunkTimeout = Math.min(CHUNK_TIMEOUT_MS, remainingMs);
+            const thisChunkTimeout = Math.min(tFirstChunk ? CHUNK_TIMEOUT_MS : FIRST_CHUNK_TIMEOUT_MS, remainingMs);
             const timeoutPromise = new Promise<never>((_, reject) => {
               chunkTimer = setTimeout(() => {
                 const e: any = new Error('Chunk wait exceeded ' + thisChunkTimeout + 'ms (deadline-bounded)');
@@ -957,7 +961,7 @@ app.post('/api/chat', async (req, res) => {
           if (isAborted) break;
           if (buffered.trim().length > 0) {
             fullText = buffered;
-            console.log(`timing generate model=${model} firstChunk=${tFirstChunk}ms total=${Date.now() - tGenStart}ms chars=${buffered.length} usage=${JSON.stringify(lastUsage)}`);
+            console.log(`timing generate model=${model} firstChunk=${tFirstChunk}ms total=${Date.now() - tGenStart}ms chars=${buffered.length} tokens=${JSON.stringify({ prompt: lastUsage?.promptTokenCount, out: lastUsage?.candidatesTokenCount, thoughts: lastUsage?.thoughtsTokenCount })}`);
             break;
           }
           // Empty answer from this model is not accepted; try the fallback below, then next model.
