@@ -9,12 +9,6 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// DIAGNOSTIC (temporary): log only allowlisted status/code tokens and the model id, never messages.
-function diagModelError(where: string, model: string, err: any) {
-  const tok = (v: any) => { const t = String(v ?? ''); return /^[A-Za-z0-9_.-]{1,40}$/.test(t) ? t : 'other'; };
-  console.log(`diag model-error where=${where} model=${tok(model)} status=${tok(err?.status)} code=${tok(err?.code)} apiStatus=${tok(err?.error?.status)} name=${tok(err?.name)}`);
-}
-
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -892,7 +886,7 @@ app.post('/api/chat', async (req, res) => {
           ]);
           break;
         } catch (err: any) {
-          lastError = err; diagModelError('stream', model, err);
+          lastError = err;
           const status = err?.status || err?.code;
           const msg = err?.message || '';
 
@@ -988,7 +982,7 @@ app.post('/api/chat', async (req, res) => {
             break;
           }
         } catch (err: any) {
-          lastError = err; diagModelError('direct', model, err);
+          lastError = err;
         }
       }
     }
